@@ -1,0 +1,216 @@
+{
+  "id": "ocrDemoFactures",
+  "name": "OCR Demo — OCR.space",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Configuration\n\nLa clé OCR.space est déjà renseignée dans le\nnœud **OCR.space**.\n\n1. **Activer** le workflow (bouton en haut à droite).\n\n2. Copier l'URL de production du nœud **Webhook**\n   et la coller dans `index.html`\n   (constante `WEBHOOK_URL` en haut du script).\n\nMoteur 2 obligatoire : le moteur 3 ne sait pas\nproduire de PDF consultable.\n\nSi le navigateur affiche une erreur CORS, voir la\nsection dédiée du README.",
+        "height": 420,
+        "width": 380,
+        "color": 4
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Lisez-moi",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-260, -80]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ocr",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [180, 100],
+      "webhookId": "b7c1e2d3-4f5a-4b6c-8d9e-0a1b2c3d4e5f"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.ocr.space/parse/image",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "YOUR_OCRSPACE_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "base64Image",
+              "value": "={{ $json.body.imageBase64 }}"
+            },
+            {
+              "name": "language",
+              "value": "fre"
+            },
+            {
+              "name": "OCREngine",
+              "value": "2"
+            },
+            {
+              "name": "isCreateSearchablePdf",
+              "value": "true"
+            },
+            {
+              "name": "isSearchablePdfHideTextLayer",
+              "value": "true"
+            },
+            {
+              "name": "detectOrientation",
+              "value": "true"
+            },
+            {
+              "name": "scale",
+              "value": "true"
+            },
+            {
+              "name": "isTable",
+              "value": "true"
+            },
+            {
+              "name": "isOverlayRequired",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "OCR.space",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [400, 100],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.IsErroredOnProcessing === true || !$json.SearchablePDFURL }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Erreur ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [620, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise l'erreur OCR.space (ErrorMessage est tantôt string, tantôt array)\nconst r = $input.first().json;\nconst raw = r.ErrorMessage ?? r.ErrorDetails ?? r.message;\nconst message = (Array.isArray(raw) ? raw.join(' ') : raw) || 'Réponse OCR.space incomplète (pas de PDF consultable).';\n\nreturn [{\n  json: {\n    ok: false,\n    page: $('Webhook').first().json.body.page ?? 1,\n    error: String(message),\n  },\n}];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Formater erreur",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, -20]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.SearchablePDFURL }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Télécharger PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Selon N8N_DEFAULT_BINARY_DATA_MODE, `binary.data.data` contient soit le\n// base64, soit l'identifiant du stockage (« filesystem-v2 »). Le helper renvoie\n// les octets dans les deux cas.\nconst ocr = $('OCR.space').first().json;\nconst parsed = (ocr.ParsedResults ?? [])[0] ?? {};\nconst page = $('Webhook').first().json.body.page ?? 1;\n\nlet pdfBase64 = '';\ntry {\n  pdfBase64 = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('base64');\n} catch (e) {\n  return [{ json: { ok: false, page, error: 'Lecture du PDF impossible : ' + e.message } }];\n}\n\n// JVBER = « %PDF » en base64 : garde-fou contre une page d'erreur HTML\nif (!pdfBase64.startsWith('JVBER')) {\n  return [{ json: { ok: false, page, error: 'La réponse n\\u2019est pas un PDF valide.' } }];\n}\n\nreturn [{\n  json: {\n    ok: true,\n    page,\n    text: parsed.ParsedText ?? '',\n    exitCode: parsed.FileParseExitCode ?? null,\n    ms: Number(ocr.ProcessingTimeInMilliseconds ?? 0),\n    pdfBase64,\n  },\n}];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "Formater",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 220]
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "Répondre",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1320, 100]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "OCR.space", "type": "main", "index": 0 }]]
+    },
+    "OCR.space": {
+      "main": [[{ "node": "Erreur ?", "type": "main", "index": 0 }]]
+    },
+    "Erreur ?": {
+      "main": [
+        [{ "node": "Formater erreur", "type": "main", "index": 0 }],
+        [{ "node": "Télécharger PDF", "type": "main", "index": 0 }]
+      ]
+    },
+    "Formater erreur": {
+      "main": [[{ "node": "Répondre", "type": "main", "index": 0 }]]
+    },
+    "Télécharger PDF": {
+      "main": [[{ "node": "Formater", "type": "main", "index": 0 }]]
+    },
+    "Formater": {
+      "main": [[{ "node": "Répondre", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
