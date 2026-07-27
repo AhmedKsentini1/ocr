@@ -7,6 +7,7 @@ sélectionnable** plus le texte brut extrait.
 ```
 index.html            interface (fichier unique, aucun build)
 ocr-workflow.json     workflow n8n à importer
+export-workflow.json  workflow n8n d'export Word / Excel (Adobe)
 test-webhook.sh       vérification de bout en bout du workflow
 xp/                   factures d'exemple
 ```
@@ -73,6 +74,75 @@ PDF, et l'interface affiche « Le service OCR n'a pas renvoyé de PDF ».
 (tunnel, reverse proxy) et changez la constante `WEBHOOK_URL` en haut du `<script>` de
 `index.html`, ou saisissez l'URL dans le panneau *⚙ Configuration* de l'interface — elle prend le
 pas sur la constante et reste mémorisée dans le navigateur.
+
+## Export Word / Excel
+
+Deuxième workflow, **indépendant du premier** : `export-workflow.json`. Il délègue la conversion
+à **Adobe PDF Services**, qui produit un `.docx` respectant la mise en page d'origine et un
+`.xlsx` où les tableaux retombent dans de vraies cellules.
+
+Mise en service :
+
+1. Créer un projet sur [developer.adobe.com/document-services](https://developer.adobe.com/document-services/)
+   et récupérer le *client ID* et le *client secret*.
+2. Fabriquer la copie locale porteuse des clés — `*.local.json` est dans `.gitignore`, les vraies
+   clés ne partent donc jamais dans git :
+
+```bash
+sed -e 's/YOUR_ADOBE_CLIENT_ID/votre-id/' \
+    -e 's/YOUR_ADOBE_CLIENT_SECRET/votre-secret/' \
+    export-workflow.json > export-workflow.local.json
+```
+
+3. Importer, publier et redémarrer, comme pour l'autre workflow :
+
+```bash
+export MSYS_NO_PATHCONV=1
+docker cp export-workflow.local.json aiwp_n8n:/tmp/export-workflow.json
+docker exec aiwp_n8n n8n import:workflow --input=/tmp/export-workflow.json
+docker exec aiwp_n8n n8n publish:workflow --id=adobeExportWordExcel
+docker restart aiwp_n8n
+```
+
+L'interface **ne demande pas de seconde URL** : elle remplace le dernier segment de l'URL OCR par
+`/export`. `…/webhook/ocr` devient donc `…/webhook/export`, sur le même serveur.
+
+### Pourquoi le tableur est fabriqué à partir du .docx
+
+Adobe sait exporter directement en `.xlsx`. **Sur les factures de `xp/`, le résultat est
+inutilisable** : la totalité du tableau de lignes atterrit dans une seule cellule, en-tête et
+données confondues. Rien ne peut être sommé.
+
+Son export **Word**, lui, reconnaît très bien les tableaux — 13 `<w:tbl>` sur la même facture,
+dont les lignes d'articles réparties sur les 10 bonnes colonnes. Le workflow demande donc
+**toujours du `.docx`** ; quand l'utilisateur a cliqué *Excel*, le nœud *Tableaux* rouvre le
+`.docx` (c'est un ZIP), lit les `<w:tbl>` et les reverse dans une feuille.
+
+Effets de bord utiles : une seule opération Adobe quel que soit le bouton, et aucun second
+prestataire à contractualiser.
+
+Deux contraintes n8n que la chaîne doit contourner — les deux échouent **en silence** :
+
+- **`require('zlib')` est interdit** dans un nœud *Code* (`Module 'zlib' is disallowed`). Ce
+  conteneur n'autorise que `NODE_FUNCTION_ALLOW_EXTERNAL=docx,pdf-lib,archiver`, et aucun module
+  natif. D'où le nœud *Decompresser* (nœud *Compression* standard) plutôt qu'un dézippage maison.
+- **Le nœud *Compression* ne dézippe que si `fileExtension` vaut `zip`.** Adobe étiquette son
+  fichier `docx` — qui *est* un zip — et le nœud le laisse alors passer en produisant un binaire
+  **vide, sans erreur**. Le nœud *Renommer* corrige l'étiquette juste avant.
+
+Le nœud *Tableaux* énumère les entrées trouvées dans son message d'erreur : si un jour la sortie
+du dézippage change de nom, l'erreur le dit au lieu de laisser deviner.
+
+Trois points à connaître :
+
+- **Adobe ne devine pas qu'une page est un tableau.** Le format est imposé par le bouton cliqué.
+  D'où deux boutons plutôt qu'un détecteur : l'utilisateur sait ce qu'il a déposé, et si le
+  résultat ne convient pas, l'autre bouton est à côté.
+- **Le PDF envoyé est l'original**, pas celui reconstruit par l'OCR — Adobe fait sa propre
+  reconnaissance, meilleure que celle de la chaîne OCR.space. L'étape est sautée (`ocr: false`)
+  quand le document possède déjà une couche texte.
+- **La conversion part au clic**, jamais au dépôt du fichier. Un document déposé mais non exporté
+  ne consomme aucun quota.
 
 ## Comment ça marche
 
@@ -168,7 +238,22 @@ texte à la souris et le coller ailleurs.
 
 ## Limites assumées
 
-- **500 requêtes/jour et 25 000/mois** sur la clé gratuite ; une requête = une page.
+- **500 requêtes/jour et 25 000/mois** sur la clé OCR.space gratuite ; une requête = une page.
+- **500 conversions/mois** sur l'offre Adobe gratuite ; une conversion = un document jusqu'à
+  50 pages. Au-delà, la tarification n'est pas publique : il faut demander un devis à Adobe.
+- **Un scan converti en Word n'est jamais identique à l'original** : l'image ne contient aucune
+  information de police, Word en substitue une approchante. Les PDF déjà textuels, eux, se
+  convertissent très fidèlement.
+- **10 Mo par PDF exporté**, marge sous la limite de charge utile de n8n (16 Mo, +33 % en base64).
+- **Le tableur reprend *tous* les tableaux du document**, séparés par une ligne vide, sans choisir
+  lequel est celui des articles. Sur une facture scannée, les blocs voisins peuvent se retrouver
+  fusionnés dans un même tableau (vérifié sur `img20260716_11311808.pdf`) : les lignes d'articles
+  restent justes, l'entourage est bruité.
+- **Le bouton Excel ne vaut que pour les factures à tableau encadré.** Sur `HENKEL(P92)…`, dont le
+  tableau d'articles n'a pas de filets, l'export Word rend chaque ligne d'article dans **une seule
+  cellule** : le tableur en hérite et devient inexploitable. Voir « Pistes » ci-dessous.
+- **Les nombres sont typés au format francophone** (`56,221` → `56.221`). Un document anglo-saxon
+  (`1,234.56`) resterait du texte — le motif est dans le nœud *Tableaux*.
 - **Pas d'extraction de champs structurés** (n° de facture, MF, HT/TVA/TTC, lignes) — la démo
   livre du texte et un PDF consultable. C'est l'étape suivante naturelle, via un nœud LLM.
 - **Traitement séquentiel** des pages, pour garder la barre de progression lisible et rester

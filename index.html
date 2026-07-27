@@ -284,9 +284,14 @@ const WEBHOOK_URL = 'http://localhost:5678/webhook/ocr';   // point d'accès de 
 const TARGET_WIDTH  = 1600;       // largeur de rendu des pages (px)
 const MAX_BYTES     = 950 * 1024; // marge sous la limite d'envoi de 1 Mo
 const NATIVE_MIN_CHARS = 120;     // seuil de détection d'une couche texte existante
+const MAX_EXPORT_BYTES = 10 * 1024 * 1024; // marge sous la charge utile n8n (16 Mo, +33 % en base64)
 
 const $ = s => document.querySelector(s);
 const hookUrl = () => (localStorage.getItem('ocrHook') || WEBHOOK_URL).trim();
+// Même serveur que l'OCR, chemin « /export » : une seule case à configurer.
+// La barre finale est retirée d'abord, sinon « …/ocr/ » donnerait « …/ocr/export ».
+const toExportUrl = u => u.replace(/\/+$/, '').replace(/\/[^/]*$/, '/export');
+const exportUrl = () => toExportUrl(hookUrl());
 
 /* ---------- pdf.js : worker via blob (fonctionne aussi en file://) ---------- */
 const WORKER_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -629,6 +634,8 @@ function renderDetail() {
         <button class="btn primary" data-act="dl-pdf" ${d.pdfUrl ? '' : 'disabled'}>
           ⬇ PDF consultable</button>
         <button class="btn" data-act="dl-txt">⬇ Texte brut (.txt)</button>
+        <button class="btn" data-act="dl-docx">⬇ Word (.docx)</button>
+        <button class="btn" data-act="dl-xlsx">⬇ Excel (.xlsx)</button>
         <button class="btn ghost" data-act="copy">Copier le texte</button>
       </div>`}
 
@@ -749,9 +756,22 @@ document.addEventListener('click', async e => {
   if (act === 'dl-pdf' && d.pdfUrl) {
     download(d.pdfUrl, d.name.replace(/\.[^.]+$/, '') + '-consultable.pdf');
   } else if (act === 'dl-txt') {
-    const url = URL.createObjectURL(new Blob([fullText(d)], { type: 'text/plain;charset=utf-8' }));
-    download(url, d.name.replace(/\.[^.]+$/, '') + '.txt');
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    downloadBlob(d, '.txt', new Blob([fullText(d)], { type: 'text/plain;charset=utf-8' }));
+  } else if (act === 'dl-docx' || act === 'dl-xlsx') {
+    // La conversion prend plusieurs secondes : on verrouille le bouton le temps
+    // de l'aller-retour plutôt que de laisser l'utilisateur cliquer en rafale.
+    const btn = e.target.closest('[data-act]');
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = '⏳ Conversion…';
+    try {
+      await exportDoc(d, act.slice(3));
+      $('#landing-msg').innerHTML = '<span style="color:var(--ok)">Fichier converti.</span>';
+    } catch (err) {
+      $('#landing-msg').innerHTML =
+        `<span style="color:var(--err)">${err.message}</span>`;
+    } finally {
+      btn.disabled = false; btn.textContent = label;
+    }
   } else if (act === 'copy') {
     await navigator.clipboard.writeText(fullText(d));
     e.target.textContent = '✓ Copié';
@@ -763,6 +783,62 @@ function download(url, name) {
   const a = document.createElement('a');
   a.href = url; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
+}
+
+function downloadBlob(doc, ext, blob) {
+  const url = URL.createObjectURL(blob);
+  download(url, doc.name.replace(/\.[^.]+$/, '') + ext);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+const EXPORT_MIME = {
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+
+const blobToB64 = blob => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1]);
+  r.onerror = () => rej(new Error('Lecture du fichier impossible.'));
+  r.readAsDataURL(blob);
+});
+
+/** PDF à convertir : l'original s'il y en a un, sinon celui reconstruit par l'OCR. */
+async function sourcePdf(doc) {
+  const isPdf = /\.pdf$/i.test(doc.name) || doc.file?.type === 'application/pdf';
+  if (isPdf && doc.file) return doc.file;
+  if (!doc.pdfUrl) throw new Error('Aucun PDF disponible pour ce document.');
+  return (await fetch(doc.pdfUrl)).blob();
+}
+
+/**
+ * Conversion Word/Excel déléguée à Adobe PDF Services via n8n.
+ * Le format est imposé ici : Adobe convertit vers ce qu'on lui demande, il ne
+ * devine pas qu'une page est un tableau.
+ */
+async function exportDoc(doc, format) {
+  const blob = await sourcePdf(doc);
+  if (blob.size > MAX_EXPORT_BYTES) {
+    throw new Error(`PDF trop volumineux (${kb(blob.size)}, maximum ${kb(MAX_EXPORT_BYTES)}).`);
+  }
+  const res = await fetch(exportUrl(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      pdfBase64: await blobToB64(blob),
+      format,
+      ocr: !doc.native,          // couche texte déjà présente => inutile de re-OCR
+    }),
+  });
+  if (!res.ok) throw new Error(`Le service de conversion a répondu ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Conversion échouée.');
+  // PK = signature ZIP : docx et xlsx en sont. Sans ce contrôle, une réponse
+  // d'erreur se télécharge en silence sous forme de fichier illisible.
+  if (!/^UEsDB/.test(data.fileBase64 || '')) {
+    throw new Error('La réponse du service n’est pas un fichier Office valide.');
+  }
+  downloadBlob(doc, '.' + format, b64ToBlob(data.fileBase64, EXPORT_MIME[format]));
 }
 
 /* ============================================================
@@ -803,6 +879,14 @@ if (new URLSearchParams(location.search).has('selftest')) (async () => {
   await rebuildPdf(doc);
   const merged = await PDFLib.PDFDocument.load(await (await fetch(doc.pdfUrl)).arrayBuffer());
   ok(merged.getPageCount() === 5, `fusion 3+2 pages = ${merged.getPageCount()} (attendu 5)`);
+
+  // 4. l'URL d'export se déduit de celle de l'OCR, barre finale comprise
+  const cases = [
+    ['http://localhost:5678/webhook/ocr',   'http://localhost:5678/webhook/export'],
+    ['https://n8n.example.com/webhook/ocr/', 'https://n8n.example.com/webhook/export'],
+  ];
+  cases.forEach(([from, want]) =>
+    ok(toExportUrl(from) === want, `toExportUrl(${from}) → ${toExportUrl(from)}`));
 
   console.log('Auto-test terminé.');
 })();

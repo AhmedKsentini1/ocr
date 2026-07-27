@@ -1,3 +1,5 @@
 xp/
 resultat-consultable.pdf
 .claude/settings.local.json
+# workflows contenant de vraies clés — jamais versionnés
+*.local.json
