@@ -5,7 +5,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Configuration\n\nLa clé OCR.space est déjà renseignée dans le\nnœud **OCR.space**.\n\n1. **Activer** le workflow (bouton en haut à droite).\n\n2. Copier l'URL de production du nœud **Webhook**\n   et la coller dans `index.html`\n   (constante `WEBHOOK_URL` en haut du script).\n\nMoteur 2 obligatoire : le moteur 3 ne sait pas\nproduire de PDF consultable.\n\nSi le navigateur affiche une erreur CORS, voir la\nsection dédiée du README.",
+        "content": "## Configuration\n\n1. Définir `OCRSPACE_API_KEY` dans les variables\n   d'environnement du serveur n8n, puis\n   **redémarrer n8n** : le nœud **OCR.space** la\n   lit via `$env`, il n'y a rien à saisir ici.\n\n2. **Activer** le workflow (bouton en haut à droite).\n\n3. Copier l'URL de production du nœud **Webhook**\n   et la coller dans `index.html`\n   (constante `WEBHOOK_URL` en haut du script).\n\nMoteur 2 obligatoire : le moteur 3 ne sait pas\nproduire de PDF consultable.\n\nSi le navigateur affiche une erreur CORS, voir la\nsection dédiée du README.",
         "height": 420,
         "width": 380,
         "color": 4
@@ -41,7 +41,7 @@
           "parameters": [
             {
               "name": "apikey",
-              "value": "YOUR_OCRSPACE_API_KEY"
+              "value": "={{ $env.OCRSPACE_API_KEY }}"
             }
           ]
         },

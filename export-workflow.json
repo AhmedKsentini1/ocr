@@ -5,7 +5,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Configuration\n\n1. Créer un projet sur\n   developer.adobe.com/document-services\n   (offre gratuite : 500 conversions / mois,\n   1 conversion = jusqu'à 50 pages).\n\n2. Remplacer `YOUR_ADOBE_CLIENT_ID` et\n   `YOUR_ADOBE_CLIENT_SECRET` dans les nœuds\n   **Jeton**, **Asset**, **Export** et **Statut**.\n\n3. **Activer** le workflow.\n\nL'URL de production du **Webhook** doit se terminer\npar `/export` sur le même serveur que `/ocr` :\nl'interface la déduit toute seule.\n\nLe format (`docx` / `xlsx`) est choisi par le\nnavigateur, Adobe ne le devine pas.",
+        "content": "## Configuration\n\n1. Créer un projet sur\n   developer.adobe.com/document-services\n   (offre gratuite : 500 conversions / mois,\n   1 conversion = jusqu'à 50 pages).\n\n2. Définir `ADOBE_CLIENT_ID` et\n   `ADOBE_CLIENT_SECRET` dans les variables\n   d'environnement du serveur n8n, puis\n   **redémarrer n8n** : les nœuds **Jeton**,\n   **Asset**, **Export** et **Statut** les lisent\n   via `$env`, il n'y a rien à saisir ici.\n\n3. **Activer** le workflow.\n\nL'URL de production du **Webhook** doit se terminer\npar `/export` sur le même serveur que `/ocr` :\nl'interface la déduit toute seule.\n\nLe format (`docx` / `xlsx`) est choisi par le\nnavigateur, Adobe ne le devine pas.",
         "height": 460,
         "width": 380,
         "color": 4
@@ -48,11 +48,11 @@
           "parameters": [
             {
               "name": "client_id",
-              "value": "YOUR_ADOBE_CLIENT_ID"
+              "value": "={{ $env.ADOBE_CLIENT_ID }}"
             },
             {
               "name": "client_secret",
-              "value": "YOUR_ADOBE_CLIENT_SECRET"
+              "value": "={{ $env.ADOBE_CLIENT_SECRET }}"
             }
           ]
         },
@@ -82,7 +82,7 @@
             },
             {
               "name": "X-API-Key",
-              "value": "YOUR_ADOBE_CLIENT_ID"
+              "value": "={{ $env.ADOBE_CLIENT_ID }}"
             }
           ]
         },
@@ -164,7 +164,7 @@
             },
             {
               "name": "X-API-Key",
-              "value": "YOUR_ADOBE_CLIENT_ID"
+              "value": "={{ $env.ADOBE_CLIENT_ID }}"
             }
           ]
         },
@@ -202,7 +202,7 @@
             },
             {
               "name": "X-API-Key",
-              "value": "YOUR_ADOBE_CLIENT_ID"
+              "value": "={{ $env.ADOBE_CLIENT_ID }}"
             }
           ]
         },

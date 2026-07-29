@@ -19,16 +19,21 @@ Le workflow est **importé et actif** dans le conteneur `aiwp_n8n` (n8n 2.22.6) 
 | | |
 |---|---|
 | Workflow | *OCR Demo — OCR.space* — id `ocrDemoFactures` |
-| Webhook | `http://localhost:5678/webhook/ocr` |
+| Webhook | `https://ocr.4prod.tn/webhook/ocr` |
+| Interface | https://demo-ocr.4prod.tn (conteneur nginx, déployé par Coolify depuis ce dépôt) |
 | Éditeur | http://localhost:5678 (`admin` / `Admin123`) |
 
-`index.html` pointe déjà sur cette URL : **double-cliquez dessus et déposez une facture**,
+`index.html` pointe déjà sur l'URL de production : **ouvrez l'interface et déposez une facture**,
 il n'y a rien à configurer.
+
+> Le champ *Réglages* de l'interface enregistre l'URL saisie dans `localStorage`, et cette valeur
+> **prime sur `WEBHOOK_URL`**. Après un changement d'URL dans le code, vider l'entrée pour que le
+> nouveau réglage s'applique : `localStorage.removeItem('ocrHook')` dans la console du navigateur.
 
 Vérification à tout moment :
 
 ```bash
-./test-webhook.sh http://localhost:5678/webhook/ocr
+./test-webhook.sh https://ocr.4prod.tn/webhook/ocr
 ```
 
 ```
