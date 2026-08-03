@@ -5,7 +5,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Configuration\n\n1. Créer un projet sur\n   developer.adobe.com/document-services\n   (offre gratuite : 500 conversions / mois,\n   1 conversion = jusqu'à 50 pages).\n\n2. Définir `ADOBE_CLIENT_ID` et\n   `ADOBE_CLIENT_SECRET` dans les variables\n   d'environnement du serveur n8n, puis\n   **redémarrer n8n** : les nœuds **Jeton**,\n   **Asset**, **Export** et **Statut** les lisent\n   via `$env`, il n'y a rien à saisir ici.\n\n3. **Activer** le workflow.\n\nL'URL de production du **Webhook** doit se terminer\npar `/export` sur le même serveur que `/ocr` :\nl'interface la déduit toute seule.\n\nLe format (`docx` / `xlsx`) est choisi par le\nnavigateur, Adobe ne le devine pas.",
+        "content": "## Configuration\n\n1. Créer un projet sur\n   developer.adobe.com/document-services\n   (offre gratuite : 500 conversions / mois,\n   1 conversion = jusqu'à 50 pages).\n\n2. Définir `ADOBE_CLIENT_ID` et\n   `ADOBE_CLIENT_SECRET` dans les variables\n   d'environnement du serveur n8n, puis\n   **redémarrer n8n** : les nœuds **Jeton**,\n   **Asset**, **Export** et **Statut** les lisent\n   via `$env`, il n'y a rien à saisir ici.\n\n3. **Activer** le workflow.\n\nL'URL de production du **Webhook** doit se terminer\npar `/export` sur le même serveur que `/ocr` :\nl'interface la déduit toute seule.\n\nCe workflow ne produit que du **Word**. Le tableur\nest reconstruit dans le navigateur à partir de la\ngéométrie du texte — il ne passe pas par ici et ne\nconsomme aucun quota Adobe.",
         "height": 460,
         "width": 380,
         "color": 4
@@ -326,107 +326,14 @@
     },
     {
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "loose",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "d1000000-0000-4000-8000-000000000003",
-              "leftValue": "={{ $('Webhook').first().json.body.format }}",
-              "rightValue": "xlsx",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "looseTypeValidation": true,
-        "options": {}
-      },
-      "id": "b2000000-0000-4000-8000-00000000000f",
-      "name": "Tableur ?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        2000,
-        100
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Le nœud « Decompresser » ne dézippe que si fileExtension vaut « zip ».\n// Adobe renvoie le fichier étiqueté « docx » — qui *est* un zip, mais le nœud\n// l'ignorerait en silence et sortirait un binaire vide. On le réétiquette.\nconst item = $input.first();\nconst bin = item.binary?.data;\nif (!bin) throw new Error('Aucun fichier reçu d\\u2019Adobe.');\n\nreturn [{\n  json: item.json,\n  binary: {\n    data: { ...bin, fileName: 'document.zip', fileExtension: 'zip', mimeType: 'application/zip' },\n  },\n}];"
-      },
-      "id": "b2000000-0000-4000-8000-000000000013",
-      "name": "Renommer",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        2150,
-        20
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "decompress",
-        "binaryPropertyName": "data",
-        "outputPrefix": "z_"
-      },
-      "id": "b2000000-0000-4000-8000-000000000012",
-      "name": "Decompresser",
-      "type": "n8n-nodes-base.compression",
-      "typeVersion": 1.1,
-      "position": [
-        2300,
-        20
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Adobe convertit toujours vers .docx : c'est son export Word qui reconnaît\n// les tableaux (l'export Excel, lui, empile des blocs entiers dans une seule\n// cellule — vérifié sur les factures de xp/). On récupère donc les <w:tbl>\n// du document Word pour bâtir le tableur.\n//\n// Le .docx (un ZIP) a été ouvert par le nœud « Decompresser » : impossible de le\n// faire ici, le runner n8n interdit require('zlib').\n// On cherche word/document.xml sans présumer du nom de propriété : selon la\n// version, n8n nomme les sorties d'après le préfixe (file_0…) ou le chemin.\nfunction findDocumentXml(bin) {\n  const hit = Object.keys(bin).find(k =>\n    /(^|\\/)document\\.xml$/i.test(bin[k].fileName ?? '') || /document\\.xml$/i.test(k));\n  if (hit) return hit;\n  throw new Error('word/document.xml introuvable — entrées : ' +\n    Object.keys(bin).map(k => k + '=' + (bin[k].fileName ?? '?')).join(', '));\n}\n\nconst unescapeXml = s => s\n  .replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/&quot;/g, '\"').replace(/&apos;/g, \"'\")\n  .replace(/&amp;/g, '&');\n\n// « 1 234,56 » et « 2,000 » deviennent des nombres, sinon aucune somme Excel ne\n// fonctionne. Les pourcentages, codes et dates ne correspondent pas au motif et\n// restent du texte.\n// ponytail: virgule décimale francophone uniquement ; pour un document anglo-\n// saxon (« 1,234.56 ») il faudrait choisir le motif selon la langue du webhook.\nconst NUM = /^-?\\d{1,3}(?:[  ]\\d{3})*(?:,\\d+)?$|^-?\\d+(?:,\\d+)?$/;\nconst typed = v => (NUM.test(v) ? Number(v.replace(/[  ]/g, '').replace(',', '.')) : v);\n\nconst key = findDocumentXml($input.first().binary ?? {});\nconst xml = (await this.helpers.getBinaryDataBuffer(0, key)).toString('utf8');\nconst cellText = c => unescapeXml(\n  [...c.matchAll(/<w:t(?:\\s[^>]*)?>([\\s\\S]*?)<\\/w:t>/g)].map(m => m[1]).join(''))\n  .replace(/\\s+/g, ' ').trim();\n\nconst seen = new Set();\nconst tables = [];\nfor (const m of xml.matchAll(/<w:tbl>[\\s\\S]*?<\\/w:tbl>/g)) {\n  const rows = [...m[0].matchAll(/<w:tr[ >][\\s\\S]*?<\\/w:tr>/g)]\n    .map(r => [...r[0].matchAll(/<w:tc>[\\s\\S]*?<\\/w:tc>/g)].map(c => cellText(c[0])))\n    .filter(r => r.some(Boolean));\n  if (!rows.length) continue;\n  // Word répète chaque tableau dans les blocs de repli (mc:AlternateContent).\n  const key = JSON.stringify(rows);\n  if (seen.has(key)) continue;\n  seen.add(key);\n  tables.push(rows);\n}\n\nif (!tables.length) {\n  throw new Error('Aucun tableau détecté dans ce document — essayez l\\u2019export Word.');\n}\n\nconst width = Math.max(...tables.flat().map(r => r.length));\nconst blank = () => Object.fromEntries(\n  Array.from({ length: width }, (_, i) => ['c' + (i + 1), '']));\n\nconst items = [];\ntables.forEach((t, i) => {\n  if (i) items.push({ json: blank() });   // une ligne vide entre deux tableaux\n  for (const r of t) {\n    items.push({\n      json: Object.fromEntries(\n        Array.from({ length: width }, (_, j) => ['c' + (j + 1), typed(r[j] ?? '')])),\n    });\n  }\n});\n\nreturn items;"
-      },
-      "id": "b2000000-0000-4000-8000-000000000010",
-      "name": "Tableaux",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        2400,
-        20
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "xlsx",
-        "binaryPropertyName": "data",
-        "options": {
-          "headerRow": false,
-          "fileName": "tableaux.xlsx"
-        }
-      },
-      "id": "b2000000-0000-4000-8000-000000000011",
-      "name": "Feuille",
-      "type": "n8n-nodes-base.convertToFile",
-      "typeVersion": 1.1,
-      "position": [
-        2600,
-        20
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Le fichier converti repart en base64 dans la réponse du webhook.\nconst format = $('Webhook').first().json.body.format === 'xlsx' ? 'xlsx' : 'docx';\nconst bytes = await this.helpers.getBinaryDataBuffer(0, 'data');\n\nreturn [{\n  json: {\n    ok: true,\n    format,\n    fileBase64: bytes.toString('base64'),\n  },\n}];"
+        "jsCode": "// Le .docx converti repart en base64 dans la réponse du webhook.\nconst bytes = await this.helpers.getBinaryDataBuffer(0, 'data');\n\nreturn [{ json: { ok: true, format: 'docx', fileBase64: bytes.toString('base64') } }];"
       },
       "id": "b2000000-0000-4000-8000-00000000000c",
       "name": "Sortie",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2600,
+        2000,
         100
       ]
     },
@@ -573,68 +480,6 @@
       ]
     },
     "Telecharger": {
-      "main": [
-        [
-          {
-            "node": "Tableur ?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Tableur ?": {
-      "main": [
-        [
-          {
-            "node": "Renommer",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Sortie",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Renommer": {
-      "main": [
-        [
-          {
-            "node": "Decompresser",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Decompresser": {
-      "main": [
-        [
-          {
-            "node": "Tableaux",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Tableaux": {
-      "main": [
-        [
-          {
-            "node": "Feuille",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Feuille": {
       "main": [
         [
           {

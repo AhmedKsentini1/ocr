@@ -281,14 +281,7 @@ table.kv td:last-child{font-family:ui-monospace,Consolas,monospace;font-size:12.
 /* ============================================================
    Configuration
    ============================================================ */
-// Ouvert depuis un fichier ou localhost → n8n de ce poste ; servi ailleurs → prod.
-// Choisi à l'exécution plutôt qu'à la main : une URL basculée puis oubliée est la
-// panne la plus facile à créer et la plus lente à voir.
-// Le champ « Réglages » (localStorage `ocrHook`) prime toujours sur les deux.
-const EN_LOCAL = location.protocol === 'file:' ||
-                 /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
-const WEBHOOK_URL = EN_LOCAL ? 'http://localhost:5678/webhook/ocr'
-                             : 'https://ocr.4prod.tn/webhook/ocr';
+const WEBHOOK_URL = 'https://ocr.4prod.tn/webhook/ocr';   // point d'accès de traitement OCR
 const TARGET_WIDTH  = 1600;       // largeur de rendu des pages (px)
 const MAX_BYTES     = 950 * 1024; // marge sous la limite d'envoi de 1 Mo
 const NATIVE_MIN_CHARS = 120;     // seuil de détection d'une couche texte existante
@@ -774,14 +767,9 @@ document.addEventListener('click', async e => {
     try {
       // Word part chez Adobe (mise en page conservée) ; le tableur est reconstruit
       // ici depuis la géométrie du texte : pas de quota, pas d'aller-retour.
-      const r = act === 'dl-xlsx' ? await exportXlsx(d) : (await exportDocx(d), null);
-      // Une conversion Adobe qui échoue ne bloque pas l'export : la géométrie prend
-      // le relais et le fichier sort quand même, mais avec moins de tableaux et des
-      // colonnes devinées. Le dire — sinon la dégradation passe pour le résultat normal.
-      $('#landing-msg').innerHTML = r?.docxErr
-        ? `<span style="color:var(--warn)">Tableur généré à partir de la géométrie seule ` +
-          `(${r.tableaux} tableau(x)) — conversion Adobe indisponible : ${esc(r.docxErr)}</span>`
-        : '<span style="color:var(--ok)">Fichier converti.</span>';
+      if (act === 'dl-xlsx') await exportXlsx(d);
+      else await exportDocx(d);
+      $('#landing-msg').innerHTML = '<span style="color:var(--ok)">Fichier converti.</span>';
     } catch (err) {
       $('#landing-msg').innerHTML =
         `<span style="color:var(--err)">${err.message}</span>`;
@@ -857,146 +845,7 @@ async function exportDocx(doc) {
 }
 
 /* ============================================================
-   Tableaux du .docx — source primaire
-   ------------------------------------------------------------
-   Adobe balise de vrais <w:tbl> : bornes de cellules exactes,
-   cellules multi-lignes intactes, et les petits tableaux de
-   totaux (2 lignes) qu'une détection géométrique laisse tomber.
-   Mesuré sur xp/ : 8 tableaux justes sur 7885 — dont « Crème DUO
-   biscuit cacao& lait » en une cellule et le bloc BRUT.H.T /
-   NET.H.T / Total TTC — et les 13 colonnes de 6701 alignées.
-   Là où Adobe ne balise rien (tableau sans filets : HENKEL, dont
-   5 des 7 tableaux sortent à une seule colonne), il ne reste que
-   la géométrie. D'où les deux chemins, et pas un seul.
-   ============================================================ */
-
-const WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-
-/**
- * Lit une entrée d'un ZIP en mémoire. `DecompressionStream` est natif : pas de
- * bibliothèque à charger, et surtout pas de dézippage côté n8n, où `zlib` est
- * interdit dans un nœud Code.
- */
-async function unzipEntry(bytes, wanted) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let eocd = -1;                                   // fin d'annuaire central
-  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65558); i--) {
-    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
-  }
-  if (eocd < 0) throw new Error('Archive .docx invalide.');
-  let p = dv.getUint32(eocd + 16, true);
-  const count = dv.getUint16(eocd + 10, true);
-  for (let i = 0; i < count; i++) {
-    const nameLen = dv.getUint16(p + 28, true);
-    const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nameLen));
-    if (name === wanted) {
-      const local = dv.getUint32(p + 42, true);
-      const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
-      const data = bytes.subarray(start, start + dv.getUint32(p + 20, true));
-      if (dv.getUint16(p + 10, true) === 0) return data;        // stocké tel quel
-      return new Uint8Array(await new Response(new Blob([data]).stream()
-        .pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
-    }
-    p += 46 + nameLen + dv.getUint16(p + 30, true) + dv.getUint16(p + 32, true);
-  }
-  throw new Error(`Entrée « ${wanted} » absente du .docx.`);
-}
-
-/** Texte d'une cellule : un saut de ligne par paragraphe et par <w:br>. */
-function wordText(cell) {
-  const lines = [];
-  for (const p of cell.children) {
-    if (p.localName !== 'p') continue;             // ignore un tableau imbriqué
-    let s = '';
-    for (const n of p.getElementsByTagNameNS(WNS, '*')) {
-      if (n.localName === 't') s += n.textContent;
-      else if (n.localName === 'br' || n.localName === 'cr') s += '\n';
-      else if (n.localName === 'tab') s += ' ';
-    }
-    lines.push(s);
-  }
-  return lines.join('\n').replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').trim();
-}
-
-/** Tableaux d'un `word/document.xml`. DOMParser plutôt que des regex : l'imbrication
- *  et les attributs à espace de noms cassent toute lecture par motif. */
-function docxTables(xml) {
-  const dom = new DOMParser().parseFromString(xml, 'application/xml');
-  if (dom.getElementsByTagName('parsererror').length) throw new Error('document.xml illisible.');
-  const out = [], seen = new Set();
-  for (const tbl of dom.getElementsByTagNameNS(WNS, 'tbl')) {
-    const rows = [];
-    for (const tr of tbl.children) {
-      if (tr.localName !== 'tr') continue;
-      const cells = [];
-      for (const tc of tr.children) {
-        if (tc.localName !== 'tc') continue;
-        // Une cellule fusionnée occupe N colonnes. Sans ce déroulage, tout ce qui
-        // la suit se décale sur cette ligne — une seule ligne décalée et les
-        // valeurs ne correspondent plus à leurs libellés.
-        const pr = [...tc.children].find(c => c.localName === 'tcPr');
-        const gs = pr && [...pr.children].find(c => c.localName === 'gridSpan');
-        const span = Math.max(1, +(gs?.getAttributeNS(WNS, 'val') ?? 1) || 1);
-        cells.push(wordText(tc));
-        for (let k = 1; k < span; k++) cells.push('');
-      }
-      if (cells.some(Boolean)) rows.push(cells);
-    }
-    if (!rows.length) continue;
-    const key = JSON.stringify(rows);              // Word répète les tableaux dans mc:AlternateContent
-    if (!seen.has(key)) { seen.add(key); out.push(rows); }
-  }
-  return out;
-}
-
-/**
- * Les paragraphes hors tableau, groupés par blocs consécutifs. Sans eux, le nom du
- * fournisseur — « SOCIETE GIAS INDUSTRIES », en tête de la facture — n'apparaît
- * nulle part dans le classeur : ce n'est pas un tableau, aucune des deux sources
- * ne le voyait.
- */
-function docxParagraphes(xml) {
-  const dom = new DOMParser().parseFromString(xml, 'application/xml');
-  const dansTableau = n => {
-    for (let e = n.parentNode; e && e.localName; e = e.parentNode) if (e.localName === 'tbl') return true;
-    return false;
-  };
-  const vu = new Set(), out = [];
-  for (const p of dom.getElementsByTagNameNS(WNS, 'p')) {
-    if (dansTableau(p)) continue;                              // déjà lu comme cellule
-    // Un paragraphe qui en contient d'autres est un conteneur de zone de texte :
-    // son texte est la concaténation de ses enfants, qu'on lit séparément.
-    if (p.getElementsByTagNameNS(WNS, 'p').length) continue;
-    const t = wordText({ children: [p] });
-    // Word écrit chaque dessin deux fois (mc:Choice et mc:Fallback) : sans ce
-    // dédoublonnage, tout le texte hors tableau sortait en double.
-    if (t.length < 3 || vu.has(t)) continue;
-    vu.add(t);
-    out.push(t);
-  }
-  return out;
-}
-
-/** Convertit le PDF en .docx via Adobe et en extrait tableaux et paragraphes. Coût : 1 conversion. */
-async function tablesFromDocx(doc) {
-  const blob = await sourcePdf(doc);
-  if (blob.size > MAX_EXPORT_BYTES) {
-    throw new Error(`PDF trop volumineux (${kb(blob.size)}, maximum ${kb(MAX_EXPORT_BYTES)}).`);
-  }
-  const res = await fetch(exportUrl(), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pdfBase64: await blobToB64(blob), ocr: !doc.native }),
-  });
-  if (!res.ok) throw new Error(`Le service de conversion a répondu ${res.status} ${res.statusText}`);
-  const data = await res.json();
-  if (!data.ok) throw new Error(data.error || 'Conversion échouée.');
-  const bytes = new Uint8Array(await b64ToBlob(data.fileBase64, EXPORT_MIME.docx).arrayBuffer());
-  const xml = new TextDecoder().decode(await unzipEntry(bytes, 'word/document.xml'));
-  return { tableaux: docxTables(xml), paragraphes: docxParagraphes(xml) };
-}
-
-/* ============================================================
-   Tableur — reconstruction des colonnes par géométrie (repli)
+   Tableur — reconstruction des colonnes par géométrie
    ------------------------------------------------------------
    L'ancienne chaîne passait par un .docx dont on relisait les
    <w:tbl>. Un tableau sans filets (HENKEL) n'en produit aucun :
@@ -1015,7 +864,7 @@ const ROW_TOL   = 0.6;   // écart vertical max (en hauteur de police) sur une m
 const GAP_EM    = 0.8;   // blanc minimal (en hauteur de police) séparant deux colonnes
 const VOTE_FRAC = 0.2;   // part des lignes devant confirmer une frontière de colonne
 const MIN_COLS  = 3;     // en deçà, ce n'est pas un tableau
-const MIN_ROWS  = 2;     // un bloc de totaux (entête + valeurs) tient en deux lignes
+const MIN_ROWS  = 3;
 
 const median = a => a.length ? [...a].sort((x, y) => x - y)[a.length >> 1] : 0;
 
@@ -1127,29 +976,11 @@ function detectBands(words) {
   const gap = em * GAP_EM;
   return tabularBands(lines, gap).map(band => {
     const rows = trimGrid(toRows(band, columnEdges(band, gap)));
-    // `y` sert à replacer le bloc dans l'ordre de lecture du document
-    return { rows, score: gridScore(rows), y: band[0].y };
+    const cells = rows.flat();
+    const numeric = cells.filter(c => /\d/.test(c)).length / Math.max(cells.length, 1);
+    return { rows, score: rows.length * (rows[0]?.length ?? 0) * (0.2 + numeric) };
   }).filter(b => b.rows.length >= MIN_ROWS && b.rows[0].length >= MIN_COLS)
     .sort((a, b) => b.score - a.score);
-}
-
-/** Part de cellules non vides — un vrai tableau est rempli, une grille de mise en page ne l'est pas. */
-const density = rows => {
-  const cells = rows.flat();
-  return cells.filter(c => String(c).trim()).length / Math.max(cells.length, 1);
-};
-
-/**
- * Grand, chiffré *et* rempli. Les deux premiers facteurs font gagner le tableau
- * des articles contre un bloc d'adresse ; le troisième écarte les grilles que
- * Adobe fabrique sur un scan — douze colonnes dont onze vides, qui sans lui
- * raflaient l'onglet d'accueil avec de l'entête de facture.
- */
-function gridScore(rows) {
-  if (!rows.length) return 0;
-  const cells = rows.flat();
-  const numeric = cells.filter(c => /\d/.test(c)).length / Math.max(cells.length, 1);
-  return rows.length * rows[0].length * (0.2 + numeric) * density(rows);
 }
 
 /* ---------- typage des cellules ---------- */
@@ -1252,202 +1083,129 @@ async function pageWords(doc, page) {
 
 /* ---------- écriture du classeur ---------- */
 
-// Teintes de l'interface, pour que le fichier ait l'air de sortir de l'outil.
-const XL = { accent: 'FF4F46E5', soft: 'FFEEF2FF', line: 'FFB8BEC8' };
+const HEAD = { qty: /^(qte|quantite|qty|nb|nbre|nombre)/, pu: /^(pu|prixunit|prixu|puht|prix)/,
+               tot: /^(montant|total|mtht|mht|mt|valeur)/, rem: /^(remise|rem|escompte|disc)/ };
 
-const aChiffre = r => r.some(c => /\d/.test(String(c)));
-
-/**
- * La première ligne du bloc est-elle une entête ? Uniquement si elle ne porte
- * aucun chiffre et que la suivante en porte : « Droit de timbre | 0,600 » est une
- * donnée, pas un titre, et la mettre en gras mentirait sur le document.
- */
-const estEntete = rows => rows.length >= 2 && !aChiffre(rows[0]) && aChiffre(rows[1]);
-
-/** Nom de feuille valide : 31 caractères, sans les caractères interdits par Excel. */
-const nomFeuille = n =>
-  (n.replace(/\.[^.]+$/, '').replace(/[[\]:*?/\\]/g, ' ').trim().slice(0, 31)) || 'Document';
+/** Index de la colonne dont l'entête matche `re`, ou -1. */
+const headCol = (row, re) =>
+  row.findIndex(c => re.test(deaccent(String(c)).toLowerCase().replace(/[^a-z]/g, '')));
 
 /**
- * Position de chaque bloc dans le document, pour les restituer dans l'ordre de
- * lecture. La géométrie connaît déjà sa page et son ordonnée ; un tableau venu du
- * .docx est retrouvé en cherchant le texte de ses premières cellules parmi les mots
- * situés. Quand le repérage échoue, le bloc reste juste après le précédent :
- * l'ordre du document.xml est déjà le bon, il ne lui manque qu'une échelle.
+ * Première ligne portant un libellé de colonne connu *et* suivie de chiffres.
+ * Deux garde-fous, chacun rattrapant l'échec de l'autre :
+ *  - sans le mot-clé, une ligne de méta (« Référence commande … » sur 7885)
+ *    passait pour l'entête, le gras tombait à côté et les contrôles ne
+ *    trouvaient rien ;
+ *  - sans « suivie de chiffres », exiger deux mots-clés faisait préférer le bloc
+ *    de totaux à la vraie entête d'articles (6701), qui n'en porte qu'un seul.
  */
-function situerBlocs(blocs, mots) {
-  const idx = new Map();
-  for (const { page, words } of mots) {
-    for (const w of words) {
-      const k = w.text.toLowerCase().replace(/\s+/g, '');
-      if (k.length > 2 && !idx.has(k)) idx.set(k, { page, y: w.y });
-    }
+function headerRow(rows) {
+  const res = Object.values(HEAD);
+  const numeric = r => (r ?? []).filter(c => /\d/.test(c)).length;
+  for (let i = 0; i < Math.min(rows.length - 1, 6); i++) {
+    if (res.some(re => headCol(rows[i], re) >= 0) && numeric(rows[i + 1]) >= 2) return i;
   }
-  let dernier = { page: 1, y: 0 };
-  for (const b of blocs) {
-    if (b.src === 'geo') { dernier = b.pos = { page: b.page, y: b.y ?? 0 }; continue; }
-    let trouve = null;
-    for (const cel of b.rows[0].concat(b.rows[1] ?? [])) {
-      // la cellule entière d'abord (« BRUT.H.T »), puis mot à mot : une ligne de
-      // texte comme « SOCIETE GIAS INDUSTRIES » n'est jamais un mot du calque
-      const s = String(cel);
-      const cles = [s.toLowerCase().replace(/\s+/g, ''),
-                    ...s.split(/\s+/).map(w => w.toLowerCase()).filter(w => w.length > 3)];
-      const hit = cles.find(k => k.length > 2 && idx.has(k));
-      if (hit) { trouve = idx.get(hit); break; }
-    }
-    dernier = b.pos = trouve ?? { page: dernier.page, y: dernier.y + 0.001 };
-  }
-  return blocs.sort((a, b) => a.pos.page - b.pos.page || a.pos.y - b.pos.y);
+  return 0;
+}
+
+function sheetFromBand(wb, name, band, fr) {
+  const ws = wb.addWorksheet(name);
+  band = { rows: band.rows.slice(headerRow(band.rows)) };   // on jette les méta au-dessus de l'entête
+  const typed = band.rows.map(r => r.map(c => typeCell(c, fr)));
+
+  typed.forEach(r => ws.addRow(r.map(c => c.v)));
+  typed.forEach((r, ri) => r.forEach((c, ci) => {
+    if (c.z) ws.getRow(ri + 1).getCell(ci + 1).numFmt = c.z;
+  }));
+
+  // entête : gras, figée, largeurs ajustées au contenu
+  const head = ws.getRow(1);
+  head.font = { bold: true };
+  head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEEF2FF' } };
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+  ws.columns.forEach((col, ci) => {
+    col.width = Math.min(50, Math.max(9, ...band.rows.map(r => (r[ci] ?? '').length + 2)));
+  });
+  return { ws, typed, rows: band.rows };
 }
 
 /**
- * Le document entier sur une seule feuille : chaque bloc à partir de la colonne A,
- * séparé du suivant par une ligne vide, dans l'ordre où il apparaît sur le papier.
- * Rien n'y est ajouté qui ne soit sur le document — ni colonne calculée, ni titre.
+ * Colonne « Contrôle » : qté × PU comparé au montant lu, et somme des montants.
+ * C'est le seul endroit où le classeur dit *où* l'OCR s'est trompé plutôt que de
+ * demander qu'on le croie sur parole.
  */
-function ecrireDocument(wb, doc, blocs, fr) {
-  const ws = wb.addWorksheet(nomFeuille(doc.name));
-  const large = Math.max(...blocs.map(b => Math.max(...b.rows.map(r => r.length))));
-  const larg = new Array(large).fill(8);
-  const trait = { style: 'thin', color: { argb: XL.line } };
+function addChecks(ws, typed, rows) {
+  const [q, p, t] = [HEAD.qty, HEAD.pu, HEAD.tot].map(re => headCol(rows[0], re));
+  const last = typed.length;
+  if (last < 2) return;
 
-  let r = 1, prec = null;
-  for (const bloc of blocs) {
-    // une ligne vide sépare les blocs, mais pas deux lignes de texte qui se
-    // suivent : un paragraphe aéré une ligne sur deux se lit mal
-    if (prec && !(prec.texte && bloc.texte)) r++;
-    prec = bloc;
-    const entete = !bloc.texte && estEntete(bloc.rows);
-    bloc.rows.forEach((row, i) => {
-      const ligne = ws.getRow(r);
-      // Un bloc de texte n'est pas un tableau : ni filets, ni largeur imposée à la
-      // colonne A, sinon un paragraphe de conditions de vente étirerait toute la
-      // feuille sur la largeur de sa plus longue phrase.
-      if (bloc.texte) {
-        ligne.getCell(1).value = row[0];
-        ligne.getCell(1).alignment = { wrapText: false, vertical: 'top' };
-        r++;
-        return;
-      }
-      row.forEach((brut, ci) => {
-        const { v, z } = typeCell(brut, fr);
-        const cell = ligne.getCell(ci + 1);
-        cell.value = v === '' ? null : v;
-        if (z) cell.numFmt = z;
-        // les filets reproduisent les cadres de la facture et séparent les blocs
-        cell.border = { top: trait, left: trait, bottom: trait, right: trait };
-        if (typeof v === 'string' && v.includes('\n')) {
-          cell.alignment = { wrapText: true, vertical: 'top' };
-        }
-        const l = Math.max(...String(brut ?? '').split('\n').map(s => s.length));
-        larg[ci] = Math.max(larg[ci], Math.min(l, 46));
-      });
-      if (entete && i === 0) {
-        ligne.font = { bold: true };
-        for (let c = 1; c <= row.length; c++) {
-          ligne.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: XL.soft } };
-        }
-      }
-      r++;
-    });
+  if (t >= 0) {                              // total de contrôle sous la colonne des montants
+    const cell = ws.getRow(last + 2).getCell(t + 1);
+    cell.value = { formula: `SUM(${ws.getColumn(t + 1).letter}2:${ws.getColumn(t + 1).letter}${last})` };
+    cell.numFmt = '#,##0.00';
+    cell.font = { bold: true };
+    // le libellé va à gauche de la somme — sauf si les montants sont déjà en
+    // première colonne, auquel cas il l'écraserait
+    if (t >= 1) ws.getRow(last + 2).getCell(t).value = 'Somme calculée';
   }
+  if (q < 0 || p < 0 || t < 0) return;
 
-  ws.columns.forEach((c, i) => { c.width = larg[i] + 2; });
-  ws.views = [{ showGridLines: false }];     // les filets des blocs suffisent
-  ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0,
-                   margins: { left: .4, right: .4, top: .5, bottom: .5, header: .3, footer: .3 } };
-  return ws;
-}
-
-/**
- * Empreinte d'un tableau : ses mots, pas ses cellules. Les deux sources ne
- * découpent pas au même endroit — « TVA 19 % 56,221 » d'un côté, trois cellules
- * de l'autre — donc comparer les cellules entières ne reconnaît jamais un
- * doublon. Les mots, eux, sont les mêmes.
- */
-const cellSet = rows => new Set(rows.flat()
-  .flatMap(c => String(c).toLowerCase().split(/\s+/))
-  .filter(t => t.length > 1));
-
-const overlap = (a, b) => {
-  if (!a.size || !b.size) return 0;
-  let n = 0;
-  for (const v of a) if (b.has(v)) n++;
-  return n / Math.min(a.size, b.size);      // rapporté au plus petit : détecte aussi l'inclusion
-};
-
-/**
- * Une seule version de chaque tableau. Adobe *déclare* les bornes de ses cellules,
- * la géométrie les *devine* : quand les deux décrivent le même tableau, la version
- * balisée doit gagner, même si l'autre note mieux parce qu'elle a avalé les lignes
- * voisines. Laisser la note trancher seule reperdait « cacao& lait » sur 7885 et
- * les 13 colonnes propres de 6701.
- *
- * Priorité réservée aux tableaux Adobe réellement remplis : sur un scan il produit
- * aussi des grilles larges et creuses, qui évinceraient un vrai tableau trouvé par
- * la géométrie.
- */
-function dedupeBands(bands) {
-  const solide = b => b.src === 'docx' && b.rows[0].length >= 2 && density(b.rows) >= 0.5;
-  const rang = b => (solide(b) ? 1 : 0);
-  const kept = [];
-  for (const b of [...bands].sort((x, y) => rang(y) - rang(x) || y.score - x.score)) {
-    const sig = cellSet(b.rows);
-    if (!kept.some(k => overlap(sig, k.sig) > 0.6)) kept.push({ ...b, sig });
+  const [Q, P, T] = [q, p, t].map(i => ws.getColumn(i + 1).letter);
+  // La remise fait partie du calcul : sans elle, chaque ligne remisée serait
+  // signalée comme une erreur de lecture, et l'alerte ne vaudrait plus rien.
+  const rc = headCol(rows[0], HEAD.rem);
+  const R = rc >= 0 ? ws.getColumn(rc + 1).letter : null;
+  const ci = rows[0].length + 1;
+  ws.getRow(1).getCell(ci).value = R ? 'Écart qté×PU−remise' : 'Écart qté×PU';
+  ws.getRow(1).getCell(ci).font = { bold: true };
+  for (let r = 2; r <= last; r++) {
+    const net = R ? `${Q}${r}*${P}${r}*(1-N(${R}${r}))` : `${Q}${r}*${P}${r}`;
+    const cell = ws.getRow(r).getCell(ci);
+    cell.value = { formula: `IF(COUNT(${Q}${r},${P}${r},${T}${r})<3,"",ROUND(${net},2)-ROUND(${T}${r},2))` };
+    cell.numFmt = '#,##0.00';
   }
-  return kept.map(({ sig, ...b }) => b).sort((a, b) => b.score - a.score);
+  ws.getColumn(ci).width = 14;
+  // un écart non nul = une valeur mal lue : c'est ce qu'on veut voir en rouge
+  ws.addConditionalFormatting({
+    ref: `${ws.getColumn(ci).letter}2:${ws.getColumn(ci).letter}${last}`,
+    rules: [{
+      type: 'expression', priority: 1,
+      formulae: [`AND(ISNUMBER(${ws.getColumn(ci).letter}2),ABS(${ws.getColumn(ci).letter}2)>0.01)`],
+      style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFDECED' } },
+               font: { color: { argb: 'FFC62828' }, bold: true } },
+    }],
+  });
 }
-
 
 async function exportXlsx(doc) {
-  let blocs = [];
-  let docxErr = null;
-
-  // 1. Adobe : bornes de cellules déclarées, cellules multi-lignes intactes.
-  try {
-    const { tableaux, paragraphes } = await tablesFromDocx(doc);
-    for (const rows of tableaux) {
-      const grid = trimGrid(rows);
-      if ((grid[0]?.length ?? 0) < 2) continue;   // colonne unique : mise en page, pas un tableau
-      blocs.push({ rows: grid, score: gridScore(grid), src: 'docx' });
-    }
-    // le texte hors tableau fait partie du document au même titre que le reste
-    for (const t of paragraphes) blocs.push({ rows: [[t]], score: 0, src: 'docx', texte: true });
-  } catch (e) { docxErr = e.message; }
-
-  // 2. Géométrie — toujours. Les deux sources ratent des choses différentes : sur un
-  //    scan, Adobe retrouve le bloc de taxes mais pas les lignes d'articles, et
-  //    l'inverse pour la géométrie. Elle ne coûte aucun appel réseau.
-  const mots = [];
-  let total = 0, calqueVide = 0;
+  const bands = [];
+  let mots = 0, calqueVide = 0;
   for (const p of doc.pages) {
     const { source, words } = await pageWords(doc, p);
-    mots.push({ page: p.n, words });
-    total += words.length;
+    mots += words.length;
     if (source === 'calque' && !words.length) calqueVide++;
-    for (const b of detectBands(words)) blocs.push({ ...b, page: p.n, src: 'geo' });
+    for (const b of detectBands(words)) bands.push({ ...b, page: p.n });
   }
-
-  if (!blocs.length) {
+  if (!bands.length) {
     // Zéro mot positionné n'accuse pas le document : c'est que le workflow publié
-    // ne renvoie pas encore le calque.
-    if (!total && calqueVide) throw new Error(
-      'Aucune position de texte reçue pour ce document (' + calqueVide + ' page(s) sans calque ' +
-      'OCR). Le workflow n8n publié est probablement antérieur à isOverlayRequired : réimportez ' +
-      'et publiez ocr-workflow.local.json (voir « Réimporter après modification » dans le README).');
-    throw new Error('Aucun tableau détecté dans ce document' +
-      (docxErr ? ' (conversion Adobe : ' + docxErr + ')' : '') +
-      " — l'export Word conserve la mise en page.");
+    // ne renvoie pas encore le calque. Sans cette distinction, une version n8n
+    // obsolète se présente comme « ce document n'a pas de tableau » — exactement
+    // le genre d'erreur muette qui coûte une heure.
+    if (!mots && calqueVide) throw new Error(
+      `Aucune position de texte reçue pour ce document (${calqueVide} page(s) sans calque OCR). ` +
+      'Le workflow n8n publié est probablement antérieur à isOverlayRequired : réimportez ' +
+      'et publiez ocr-workflow.json (voir « Réimporter après modification » dans le README).');
+    throw new Error("Aucun tableau détecté dans ce document — l'export Word conserve la mise en page.");
   }
-
-  blocs = situerBlocs(dedupeBands(blocs), mots);
+  bands.sort((a, b) => b.score - a.score);
 
   const fr = isFrench(fullText(doc));
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'NEXT OCR';
-  wb.created = new Date();
-  ecrireDocument(wb, doc, blocs, fr);
+  bands.forEach((band, i) => {
+    const name = i ? `Tableau ${i + 1} (p.${band.page})` : 'Lignes';
+    const { ws, typed, rows } = sheetFromBand(wb, name, band, fr);
+    if (!i) addChecks(ws, typed, rows);
+  });
 
   // trace : de quoi vérifier une cellule douteuse sans rouvrir le PDF
   const audit = wb.addWorksheet('Texte');
@@ -1455,13 +1213,12 @@ async function exportXlsx(doc) {
   audit.addRow([doc.name]);
   audit.getRow(1).font = { bold: true };
   for (const p of doc.pages) {
-    audit.addRow(['----- Page ' + p.n + ' -----']);
+    audit.addRow([`----- Page ${p.n} -----`]);
     for (const line of (p.text || '').split('\n')) audit.addRow([line.slice(0, 32000)]);
   }
 
   downloadBlob(doc, '.xlsx',
     new Blob([await wb.xlsx.writeBuffer()], { type: EXPORT_MIME.xlsx }));
-  return { docxErr, blocs: blocs.length };
 }
 
 /* ============================================================
@@ -1556,105 +1313,6 @@ if (new URLSearchParams(location.search).has('selftest')) (async () => {
   ok(T('15/03/2026') instanceof Date, 'une date devient une vraie date Excel');
   ok(isFrench('total 1 234,56 HT') && !isFrench('total 1,234.56 net'),
      'la locale décimale est déduite du document');
-
-  // 7. lecture du .docx : ZIP en mémoire, puis <w:tbl> avec cellule fusionnée.
-  //    Le ZIP est construit ici plutôt que téléchargé — l'analyse se fait à coups
-  //    de décalages d'octets, et une erreur d'offset ne se voit pas autrement.
-  const enc = new TextEncoder();
-  const zipOf = async (name, text) => {
-    const nb = enc.encode(name), raw = enc.encode(text);
-    const comp = new Uint8Array(await new Response(new Blob([raw]).stream()
-      .pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer());
-    const loc = new Uint8Array(30 + nb.length + comp.length), ld = new DataView(loc.buffer);
-    ld.setUint32(0, 0x04034b50, true); ld.setUint16(8, 8, true);
-    ld.setUint32(18, comp.length, true); ld.setUint32(22, raw.length, true);
-    ld.setUint16(26, nb.length, true);
-    loc.set(nb, 30); loc.set(comp, 30 + nb.length);
-    const cen = new Uint8Array(46 + nb.length), cd = new DataView(cen.buffer);
-    cd.setUint32(0, 0x02014b50, true); cd.setUint16(10, 8, true);
-    cd.setUint32(20, comp.length, true); cd.setUint32(24, raw.length, true);
-    cd.setUint16(28, nb.length, true); cd.setUint32(42, 0, true);
-    cen.set(nb, 46);
-    const eo = new Uint8Array(22), ed = new DataView(eo.buffer);
-    ed.setUint32(0, 0x06054b50, true); ed.setUint16(8, 1, true); ed.setUint16(10, 1, true);
-    ed.setUint32(12, cen.length, true); ed.setUint32(16, loc.length, true);
-    const out = new Uint8Array(loc.length + cen.length + eo.length);
-    out.set(loc, 0); out.set(cen, loc.length); out.set(eo, loc.length + cen.length);
-    return out;
-  };
-  const cell = (t, span) =>
-    `<w:tc>${span ? `<w:tcPr><w:gridSpan w:val="${span}"/></w:tcPr>` : ''}` +
-    t.split('|').map(p => `<w:p><w:r><w:t>${p}</w:t></w:r></w:p>`).join('') + '</w:tc>';
-  const docXml =
-    `<?xml version="1.0"?><w:document xmlns:w="${WNS}"><w:body><w:tbl>` +
-    `<w:tr>${cell('A')}${cell('B fusionnée', 2)}${cell('D')}</w:tr>` +
-    `<w:tr>${cell('1')}${cell('2')}${cell('3')}${cell('Crème|cacao&amp; lait')}</w:tr>` +
-    `</w:tbl></w:body></w:document>`;
-  const zip = await zipOf('word/document.xml', docXml);
-  const back = new TextDecoder().decode(await unzipEntry(zip, 'word/document.xml'));
-  ok(back === docXml, 'unzipEntry restitue l’entrée à l’identique');
-  const [t1] = docxTables(back);
-  ok(t1[0].length === 4 && t1[0][1] === 'B fusionnée' && t1[0][2] === '',
-     `gridSpan déroulé → ${JSON.stringify(t1[0])}`);
-  ok(t1[0][3] === 'D' && t1[1][3] === 'Crème\ncacao& lait',
-     'colonnes alignées malgré la fusion, cellule multi-lignes et entité XML décodées');
-
-  // 8. arbitrage entre les deux sources : le même tableau vu par Adobe et par la
-  //    géométrie ne doit sortir qu'une fois, dans sa version balisée.
-  const gAdobe = [['Code', 'Base', 'Taux'], ['TVA 19%', '56,221', '19%']];
-  const gGeo   = [['Code Base Taux'], ['TVA 19 % 56,221 19 %']];
-  const gAutre = [['Article', 'Qté', 'PU'], ['X', '2', '3,50'], ['Y', '4', '1,20']];
-  const res = dedupeBands([
-    { rows: gGeo,   score: gridScore(gGeo) * 99, src: 'geo' },   // note volontairement écrasante
-    { rows: gAdobe, score: gridScore(gAdobe),    src: 'docx' },
-    { rows: gAutre, score: gridScore(gAutre),    src: 'geo' },
-  ]);
-  ok(res.length === 2 && res.some(b => b.src === 'docx' && b.rows[0].length === 3),
-     `doublon arbitré en faveur du .docx → ${res.length} tableaux gardés`);
-  ok(res.some(b => b.rows[0][0] === 'Article'),
-     'un tableau que seule la géométrie voit est conservé');
-
-  // 9. ordre de lecture : les blocs doivent ressortir dans l'ordre du papier, quelle
-  //    que soit la source. Le tableau .docx est repéré par le texte de sa première
-  //    cellule parmi les mots situés ; celui de la géométrie l'est par son ordonnée.
-  const mots = [{ page: 1, words: [
-    { x: 40, y: 20,  w: 60, h: 10, text: 'Fournisseur' },
-    { x: 40, y: 200, w: 60, h: 10, text: 'Designation' },
-    { x: 40, y: 400, w: 60, h: 10, text: 'BRUT.H.T' },
-  ] }];
-  const ordre = situerBlocs([
-    { rows: [['BRUT.H.T', 'Total TTC'], ['56,221', '67,503']], src: 'docx' },
-    { rows: [['Designation', 'Qté'], ['Vis', '2']], page: 1, y: 200, src: 'geo' },
-    { rows: [['Fournisseur', 'SARL'], ['12 rue', '1000']], src: 'docx' },
-  ], mots).map(b => b.rows[0][0]);
-  ok(JSON.stringify(ordre) === JSON.stringify(['Fournisseur', 'Designation', 'BRUT.H.T']),
-     `ordre de lecture rétabli → ${ordre.join(' → ')}`);
-
-  // une ligne de texte est repérée par ses mots : « SOCIETE GIAS INDUSTRIES » n'est
-  // jamais un mot du calque, et sans ce repli le nom du fournisseur finissait en bas
-  const oTexte = situerBlocs([
-    { rows: [['BRUT.H.T', 'x'], ['1', '2']], src: 'docx' },
-    { rows: [['SOCIETE FOURNISSEUR SARL']], src: 'docx', texte: true },
-  ], [{ page: 1, words: [
-    { x: 40, y: 20, w: 60, h: 10, text: 'Fournisseur' },
-    { x: 40, y: 400, w: 60, h: 10, text: 'BRUT.H.T' },
-  ] }]).map(b => b.rows[0][0]);
-  ok(oTexte[0].startsWith('SOCIETE'), `ligne de texte replacée en tête → ${oTexte[0]}`);
-
-  // un bloc .docx introuvable dans les mots reste à sa place, pas rejeté en fin
-  const ordre2 = situerBlocs([
-    { rows: [['Fournisseur', 'SARL'], ['x', '1']], src: 'docx' },
-    { rows: [['Introuvable', 'ici'], ['y', '2']], src: 'docx' },
-    { rows: [['BRUT.H.T', 'TTC'], ['1', '2']], src: 'docx' },
-  ], mots).map(b => b.rows[0][0]);
-  ok(ordre2[1] === 'Introuvable', `bloc non repéré conservé en place → ${ordre2.join(' → ')}`);
-
-  // l'entête ne se met en gras que si c'en est une
-  ok(estEntete([['Code', 'Base', 'Taux'], ['TVA', '56,221', '19%']]), 'entête reconnue');
-  ok(!estEntete([['Droit de timbre', '0,600'], ['Avance', '']]),
-     'une ligne de données n’est pas prise pour une entête');
-  ok(gridScore([['a', 'b'], ['1', '2']]) > gridScore([['a', '', '', ''], ['1', '', '', '']]),
-     'un tableau rempli note mieux qu’une grille large et creuse');
 
   console.log('Auto-test terminé.');
 })();

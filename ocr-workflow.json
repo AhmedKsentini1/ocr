@@ -83,7 +83,7 @@
             },
             {
               "name": "isOverlayRequired",
-              "value": "false"
+              "value": "true"
             }
           ]
         },
@@ -166,7 +166,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Selon N8N_DEFAULT_BINARY_DATA_MODE, `binary.data.data` contient soit le\n// base64, soit l'identifiant du stockage (« filesystem-v2 »). Le helper renvoie\n// les octets dans les deux cas.\nconst ocr = $('OCR.space').first().json;\nconst parsed = (ocr.ParsedResults ?? [])[0] ?? {};\nconst page = $('Webhook').first().json.body.page ?? 1;\n\nlet pdfBase64 = '';\ntry {\n  pdfBase64 = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('base64');\n} catch (e) {\n  return [{ json: { ok: false, page, error: 'Lecture du PDF impossible : ' + e.message } }];\n}\n\n// JVBER = « %PDF » en base64 : garde-fou contre une page d'erreur HTML\nif (!pdfBase64.startsWith('JVBER')) {\n  return [{ json: { ok: false, page, error: 'La réponse n\\u2019est pas un PDF valide.' } }];\n}\n\nreturn [{\n  json: {\n    ok: true,\n    page,\n    text: parsed.ParsedText ?? '',\n    exitCode: parsed.FileParseExitCode ?? null,\n    ms: Number(ocr.ProcessingTimeInMilliseconds ?? 0),\n    pdfBase64,\n  },\n}];"
+        "jsCode": "// Selon N8N_DEFAULT_BINARY_DATA_MODE, `binary.data.data` contient soit le\n// base64, soit l'identifiant du stockage (« filesystem-v2 »). Le helper renvoie\n// les octets dans les deux cas.\nconst ocr = $('OCR.space').first().json;\nconst parsed = (ocr.ParsedResults ?? [])[0] ?? {};\nconst page = $('Webhook').first().json.body.page ?? 1;\n\nlet pdfBase64 = '';\ntry {\n  pdfBase64 = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('base64');\n} catch (e) {\n  return [{ json: { ok: false, page, error: 'Lecture du PDF impossible : ' + e.message } }];\n}\n\n// JVBER = « %PDF » en base64 : garde-fou contre une page d'erreur HTML\nif (!pdfBase64.startsWith('JVBER')) {\n  return [{ json: { ok: false, page, error: 'La réponse n\\u2019est pas un PDF valide.' } }];\n}\n\nreturn [{\n  json: {\n    ok: true,\n    page,\n    text: parsed.ParsedText ?? '',\n    exitCode: parsed.FileParseExitCode ?? null,\n    ms: Number(ocr.ProcessingTimeInMilliseconds ?? 0),\n    // Position de chaque mot, dans les pixels de l'image envoyée. C'est la seule\n    // source de colonnes pour un scan : l'interface en reconstruit le tableur.\n    overlay: parsed.TextOverlay ?? null,\n    pdfBase64,\n  },\n}];"
       },
       "id": "a1000000-0000-4000-8000-000000000007",
       "name": "Formater",
