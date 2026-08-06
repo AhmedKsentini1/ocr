@@ -199,6 +199,13 @@ main{overflow:auto;padding:20px 24px;min-width:0}
   font:12.5px/1.65 ui-monospace,"Cascadia Code",Consolas,monospace;tab-size:4;
 }
 .page-block pre.empty{color:var(--muted);font-style:italic}
+.sent{border-top:1px solid var(--border);background:var(--surface-2)}
+.sent summary{
+  cursor:pointer;padding:8px 16px;font-size:12px;color:var(--muted);
+  font-weight:500;list-style-position:inside;
+}
+.sent summary:hover{color:var(--text)}
+.sent img{display:block;width:100%;height:auto;border-top:1px solid var(--border);background:#fff}
 
 table.kv{width:100%;border-collapse:collapse;font-size:13px}
 table.kv td{padding:8px 16px;border-bottom:1px solid var(--border)}
@@ -212,6 +219,23 @@ table.kv td:last-child{font-family:ui-monospace,Consolas,monospace;font-size:12.
 .banner.info{background:var(--accent-soft);color:var(--accent)}
 .banner.err{background:var(--err-soft);color:var(--err)}
 .banner b{display:block;margin-bottom:2px}
+
+/* ---------- recadrage ---------- */
+dialog#crop{
+  border:0;border-radius:var(--radius);padding:0;max-width:95vw;
+  background:var(--surface);color:var(--text);box-shadow:var(--shadow);
+}
+dialog#crop::backdrop{background:rgba(0,0,0,.55)}
+#crop-cv{
+  display:block;max-width:100%;touch-action:none;cursor:crosshair;
+  border-radius:var(--radius) var(--radius) 0 0;
+}
+.crop-bar{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:11px 14px;border-top:1px solid var(--border);
+  font-size:12.5px;color:var(--muted);
+}
+.crop-bar .spacer{flex:1}
 
 @media (max-width:1080px){
   .panes{grid-template-columns:1fr}
@@ -274,6 +298,17 @@ table.kv td:last-child{font-family:ui-monospace,Consolas,monospace;font-size:12.
   <main id="detail"></main>
 </div>
 
+<dialog id="crop">
+  <canvas id="crop-cv"></canvas>
+  <div class="crop-bar">
+    <span>Glissez les quatre coins sur les bords du document.</span>
+    <div class="spacer"></div>
+    <button class="btn sm ghost" data-crop="reset">Tout le cadre</button>
+    <button class="btn sm" data-crop="cancel">Annuler</button>
+    <button class="btn sm primary" data-crop="ok">Recadrer et relancer</button>
+  </div>
+</dialog>
+
 </div>
 
 <script>
@@ -282,16 +317,44 @@ table.kv td:last-child{font-family:ui-monospace,Consolas,monospace;font-size:12.
    ============================================================ */
 const WEBHOOK_URL = 'https://ocr.4prod.tn/webhook/ocr';   // point d'accès de traitement OCR
 const TARGET_WIDTH  = 1600;       // largeur de rendu des pages (px)
+// On vise une *résolution*, pas une largeur : à TARGET_WIDTH constant, une page
+// paysage sort à 137 DPI quand une portrait est à 193 — même document, moitié
+// moins de pixels par caractère. 200 DPI est la valeur mesurée : à cette
+// résolution Adobe rend `img20260716_11311808.pdf` en 5 tableaux et 0 rognure
+// d'image, contre 0 tableau et 18 rognures sur une photo à 109 DPI.
+const TARGET_DPI    = 200;        // pour les PDF, qui se rendent à la demande
 const MAX_BYTES     = 950 * 1024; // marge sous la limite d'envoi de 1 Mo
 const NATIVE_MIN_CHARS = 120;     // seuil de détection d'une couche texte existante
 const MAX_EXPORT_BYTES = 10 * 1024 * 1024; // marge sous la charge utile n8n (16 Mo, +33 % en base64)
 
+/* ---------- redressement « scanner » ---------- */
+// Version figée : `4.x` est un lien roulant qui peut changer la veille d'une démo.
+const OPENCV_SRC   = 'https://docs.opencv.org/4.9.0/opencv.js';
+const DETECT_WIDTH = 400;   // largeur d'analyse : basse EXPRÈS, voir detectQuad
+// Trois seuils calibrés sur les échantillons de `new exp/` et `xp/`, pas choisis
+// en théorie. Ils sont volontairement sévères : un recadrage qui rogne du texte
+// est irrattrapable, alors qu'un recadrage refusé laisse le blanchiment intact
+// et le bouton « Recadrer » à portée de clic.
+const MIN_QUAD_AREA = .55;    // sinon on retient le cadre d'un tableau, pas la feuille
+const MIN_EDGE_SUPPORT = .80; // appui moyen des quatre côtés sur une arête réelle
+const MIN_EDGE_SIDE = .60;    // et aucun côté en dessous : voir edgeSupport
+// Réglages du rendu : à régler sur des photos réelles, pas en théorie. Un capteur
+// de téléphone, une ampoule et une feuille froissée ne suivent aucun modèle.
+const BG_KERNEL = 21;       // fermeture estimant le fond, sur la copie au 1/4
+const INK_MARGIN = 45;      // sous le seuil encre/papier : noir franc
+const PAPER_MARGIN = 30;    // au-dessus : blanc pur
+const SHARPEN = .7;         // dose de masque flou
+const SAT_FLOOR = 40;       // saturation en deçà de laquelle on neutralise
+const SAT_GAIN = 1.4;       // et gain appliqué au-delà
+
 const $ = s => document.querySelector(s);
 const hookUrl = () => (localStorage.getItem('ocrHook') || WEBHOOK_URL).trim();
-// Même serveur que l'OCR, chemin « /export » : une seule case à configurer.
-// La barre finale est retirée d'abord, sinon « …/ocr/ » donnerait « …/ocr/export ».
-const toExportUrl = u => u.replace(/\/+$/, '').replace(/\/[^/]*$/, '/export');
-const exportUrl = () => toExportUrl(hookUrl());
+// Même serveur que l'OCR, dernier segment remplacé : une seule case à
+// configurer pour trois webhooks. La barre finale est retirée d'abord, sinon
+// « …/ocr/ » donnerait « …/ocr/export ».
+const toSibling = (u, nom) => u.replace(/\/+$/, '').replace(/\/[^/]*$/, '/' + nom);
+const exportUrl = () => toSibling(hookUrl(), 'export');
+const tableurUrl = () => toSibling(hookUrl(), 'tableur');
 
 /* ---------- pdf.js : worker via blob (fonctionne aussi en file://) ---------- */
 const WORKER_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -334,11 +397,17 @@ function b64Bytes(dataUrl) {
   return Math.floor(b64.length * 3 / 4) - pad;
 }
 
-async function renderPdfPage(pdf, n, extraRotation = 0) {
+/* ============================================================
+   Rendu brut d'une page — avant redressement
+   ============================================================ */
+async function renderPdfCanvas(pdf, n, extraRotation = 0) {
   const page = await pdf.getPage(n);
   const rot = (page.rotate + extraRotation) % 360;
   const base = page.getViewport({ scale: 1, rotation: rot });
-  const scale = Math.min(TARGET_WIDTH / base.width, 3);
+  // 72 pt par pouce, par définition — plus un plafond en pixels : un plan A0 à
+  // 200 DPI ferait 62 Mpx et dépasserait la limite de canvas du navigateur.
+  // Ne mord jamais sur un A4 (qui plafonnerait à 4,75×, pour 2,78× demandé).
+  const scale = Math.min(TARGET_DPI / 72, 4000 / Math.max(base.width, base.height));
   const vp = page.getViewport({ scale, rotation: rot });
   const canvas = document.createElement('canvas');
   canvas.width = Math.ceil(vp.width);
@@ -347,13 +416,20 @@ async function renderPdfPage(pdf, n, extraRotation = 0) {
   ctx.fillStyle = '#fff';                       // JPEG n'a pas d'alpha
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
-  return canvasToJpeg(canvas);
+  return canvas;
 }
 
-async function renderImageFile(file, extraRotation = 0) {
+async function renderImageCanvas(file, extraRotation = 0) {
   const bmp = await createImageBitmap(file);
   const turned = extraRotation % 180 !== 0;
-  const scale = Math.min(TARGET_WIDTH / (turned ? bmp.height : bmp.width), 3);
+  // Plafond à 1 : **jamais agrandir**. Les photos qui arrivent ici sont
+  // recompressées par WhatsApp à 1600 px sur le grand côté (mesuré : les quatre
+  // échantillons du dépôt sont en 900×1600 ou 1204×1600). L'ancien facteur
+  // 1600/900 = 1,78 inventait 4,5 Mpx à partir de 1,44 Mpx, puis les compressait :
+  // mesuré, 420 Ko de rognures d'image dans le .docx contre 92 Ko à la taille
+  // native, pour un résultat de reconnaissance identique. `scale=true` demande
+  // déjà à OCR.space d'agrandir lui-même s'il le juge utile.
+  const scale = Math.min(TARGET_WIDTH / (turned ? bmp.height : bmp.width), 1);
   const w = Math.ceil((turned ? bmp.height : bmp.width) * scale);
   const h = Math.ceil((turned ? bmp.width : bmp.height) * scale);
   const canvas = document.createElement('canvas');
@@ -364,7 +440,351 @@ async function renderImageFile(file, extraRotation = 0) {
   ctx.rotate(extraRotation * Math.PI / 180);
   ctx.drawImage(bmp, -bmp.width * scale / 2, -bmp.height * scale / 2,
                 bmp.width * scale, bmp.height * scale);
-  return canvasToJpeg(canvas);
+  return canvas;
+}
+
+/** Le rendu est déterministe : on le refait plutôt que de garder les pixels. */
+const renderRaw = (doc, page) => doc.pdf
+  ? renderPdfCanvas(doc.pdf, page.n, page.rotation)
+  : renderImageCanvas(doc.file, page.rotation);
+
+/* ============================================================
+   Redressement « scanner » — OpenCV.js
+   ------------------------------------------------------------
+   Détecte le quadrilatère de la feuille, le remet à plat, puis
+   blanchit le fond. Ce qui est envoyé à l'OCR devient donc aussi
+   le PDF consultable renvoyé : une seule étape, quatre sorties
+   corrigées.
+   ============================================================ */
+let cvOk = null;          // null = pas encore tenté, true/false = verdict
+let cvLoading = null;
+
+function loadOpenCv() {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = OPENCV_SRC;
+    s.async = true;
+    s.onerror = () => reject(new Error('Téléchargement d’OpenCV impossible.'));
+    // Selon la version, `cv` est prêt dès le chargement, ou c'est une promesse,
+    // ou il signale son initialisation par onRuntimeInitialized. Les trois existent.
+    s.onload = () => {
+      if (typeof cv === 'undefined') return reject(new Error('OpenCV absent après chargement.'));
+      if (typeof cv.then === 'function') return cv.then(m => { window.cv = m; resolve(); }, reject);
+      if (cv.Mat) return resolve();
+      cv.onRuntimeInitialized = resolve;
+    };
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureCv() {
+  if (cvOk !== null) return cvOk;
+  note('Chargement du moteur de recadrage…');       // ~10 Mo, une seule fois
+  try { await (cvLoading ??= loadOpenCv()); cvOk = true; note(''); }
+  catch {
+    cvOk = false;
+    note('Moteur de recadrage indisponible — images envoyées telles quelles.', 'err');
+  }
+  return cvOk;
+}
+
+/** Les Mat vivent dans le tas WASM : le ramasse-miettes JS ne les libère pas. */
+function withMats(fn) {
+  const bag = [];
+  try { return fn(m => (bag.push(m), m)); }
+  finally { bag.forEach(m => m.delete()); }
+}
+
+/**
+ * Remet les coins dans l'ordre tl, tr, br, bl.
+ * La somme x+y est minimale en haut-gauche et maximale en bas-droite ;
+ * la différence x−y sépare les deux coins restants.
+ */
+function orderQuad(p) {
+  const by = f => p.slice().sort((a, b) => f(a) - f(b));
+  const sum = by(q => q.x + q.y), dif = by(q => q.x - q.y);
+  return [sum[0], dif[3], sum[3], dif[0]];
+}
+
+/**
+ * Quatre coins d'un contour : son approximation polygonale si elle en donne
+ * quatre, sinon le rectangle tourné qui l'englobe — qui en a toujours quatre.
+ * Ce repli sauve les feuilles coupées par le bord du cadre, dont le contour
+ * réel n'est pas un quadrilatère.
+ */
+function quadOf(contour, M) {
+  const peri = cv.arcLength(contour, true);
+  for (const eps of [0.02, 0.04, 0.06]) {
+    const approx = M(new cv.Mat());
+    cv.approxPolyDP(contour, approx, eps * peri, true);
+    if (approx.rows === 4 && cv.isContourConvex(approx)) {
+      return [0, 1, 2, 3].map(k => ({
+        x: approx.data32S[k * 2], y: approx.data32S[k * 2 + 1],
+      }));
+    }
+  }
+  return cv.RotatedRect.points(cv.minAreaRect(contour));
+}
+
+/**
+ * Le quadrilatère de la feuille, ou null si rien de crédible.
+ *
+ * Trois détails font toute la fiabilité, et aucun ne se devine :
+ *
+ * — **La basse résolution est le filtre.** Analyser en 400 px n'est pas une
+ *   économie de calcul : à 800 px, la broderie d'une nappe en dentelle produit
+ *   plus d'arêtes que la feuille et Canny ne retrouve plus son bord. Réduire
+ *   puis flouter fort transforme le tissu en aplat et ne laisse que les longues
+ *   droites du papier.
+ * — **La dilatation referme l'anneau.** Un bord de feuille est interrompu par
+ *   les plis, les ombres et les zones sans contraste ; sans elle findContours
+ *   ne voit qu'une courbe ouverte.
+ * — **RETR_EXTERNAL plus l'enveloppe convexe écartent le tableau.** Le cadre
+ *   noir du tableau d'articles est net, convexe et large : il gagne contre le
+ *   bord réel du papier dès qu'on le met en concurrence. Une fois l'anneau du
+ *   papier refermé autour de lui, il n'est plus un contour externe du tout.
+ */
+async function detectQuad(canvas) {
+  if (!await ensureCv()) return null;
+  return withMats(M => {
+    const src = M(cv.imread(canvas));
+    const s = Math.min(DETECT_WIDTH / src.cols, 1);   // jamais agrandir pour analyser
+    const small = M(new cv.Mat()), edges = M(new cv.Mat());
+    cv.resize(src, small, new cv.Size(0, 0), s, s, cv.INTER_AREA);
+    cv.cvtColor(small, edges, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(edges, edges, new cv.Size(9, 9), 0);
+    cv.Canny(edges, edges, 40, 120);
+    cv.dilate(edges, edges, M(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5))));
+
+    const contours = M(new cv.MatVector()), hierarchy = M(new cv.Mat());
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    // L'aire d'un contour d'arêtes ne veut rien dire : il longe un trait. C'est
+    // l'aire de son enveloppe convexe — la surface qu'il entoure — qui compte.
+    let sheet = null, best = MIN_QUAD_AREA * small.rows * small.cols;
+    for (let i = 0; i < contours.size(); i++) {
+      const hull = M(new cv.Mat());
+      cv.convexHull(M(contours.get(i)), hull);
+      const area = cv.contourArea(hull);
+      if (area > best) { best = area; sheet = hull; }
+    }
+    if (!sheet) return null;
+
+    const quad = quadOf(sheet, M);
+    const support = edgeSupport(edges, quad);
+    // Deux garde-fous pour deux dangers distincts : la moyenne écarte les
+    // quadrilatères entièrement inventés, le minimum écarte ceux dont trois
+    // côtés sont justes et le quatrième tiré à travers le vide — ce dernier cas
+    // rognait le numéro de commande de `new exp/invoice.jpeg`.
+    const mean = support.reduce((a, b) => a + b, 0) / 4;
+    if (mean < MIN_EDGE_SUPPORT || Math.min(...support) < MIN_EDGE_SIDE) return null;
+    return orderQuad(quad.map(p => ({ x: p.x / s, y: p.y / s })));
+  });
+}
+
+/**
+ * Pour chacun des quatre côtés, la proportion de sa longueur qui longe vraiment
+ * une arête de l'image.
+ *
+ * Sans ce contrôle, la détection ment avec aplomb. Une feuille blanche posée sur
+ * une nappe blanche n'a pas de bord gauche *dans l'image* : l'enveloppe convexe
+ * le referme quand même par une diagonale à travers le vide, et le redressement
+ * bascule alors la page de travers — vérifié sur `new exp/Tunisianet.jpeg`, dont
+ * les quatre côtés tombent à 0 · 0,2 · 0,2 · 0. Un mauvais cadrage est pire que
+ * pas de cadrage ; le blanchiment, lui, reste acquis dans les deux cas.
+ */
+function edgeSupport(edges, quad) {
+  const SAMPLES = 24, NEAR = 2;
+  return [0, 1, 2, 3].map(i => {
+    const a = quad[i], b = quad[(i + 1) % 4];
+    let strong = 0, seen = 0;
+    for (let t = 0; t < SAMPLES; t++) {
+      const f = (t + 0.5) / SAMPLES;
+      const x = Math.round(a.x + (b.x - a.x) * f);
+      const y = Math.round(a.y + (b.y - a.y) * f);
+      if (x < 0 || y < 0 || x >= edges.cols || y >= edges.rows) continue;
+      seen++;
+      // Le côté tracé passe rarement pile sur le pixel d'arête : on regarde autour.
+      let hit = false;
+      for (let dy = -NEAR; dy <= NEAR && !hit; dy++) {
+        for (let dx = -NEAR; dx <= NEAR && !hit; dx++) {
+          const xx = x + dx, yy = y + dy;
+          hit = xx >= 0 && yy >= 0 && xx < edges.cols && yy < edges.rows
+                && edges.ucharPtr(yy, xx)[0] > 0;
+        }
+      }
+      if (hit) strong++;
+    }
+    return seen ? strong / seen : 0;
+  });
+}
+
+/**
+ * Redresse `quad` (facultatif) puis blanchit le fond.
+ * Sans OpenCV, renvoie le canevas intact : la démo continue, dégradée.
+ */
+function scanify(canvas, quad) {
+  if (cvOk !== true) return canvas;
+  return withMats(M => {
+    const src = M(cv.imread(canvas));
+    let page = src;
+
+    if (quad) {
+      const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+      const [tl, tr, br, bl] = quad;
+      let w = Math.max(d(tl, tr), d(bl, br));
+      let h = Math.max(d(tl, bl), d(tr, br));
+      const k = Math.min(TARGET_WIDTH / w, 1);        // le redressement n'invente rien
+      w = Math.round(w * k); h = Math.round(h * k);
+      if (w > 1 && h > 1) {
+        const from = M(cv.matFromArray(4, 1, cv.CV_32FC2, quad.flatMap(p => [p.x, p.y])));
+        const to = M(cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, w, 0, w, h, 0, h]));
+        const xf = M(cv.getPerspectiveTransform(from, to));
+        page = M(new cv.Mat());
+        cv.warpPerspective(src, page, xf, new cv.Size(w, h),
+                           cv.INTER_LINEAR, cv.BORDER_REPLICATE, new cv.Scalar());
+      }
+    }
+
+    // 1. Aplatir l'éclairage. Le fond est estimé par une *fermeture*
+    //    morphologique, pas par un flou : un noyau plus large qu'un caractère
+    //    fait disparaître le texte et ne laisse que le papier. Un flou, lui, est
+    //    tiré vers le bas par le texte, sous-estime le papier dans les zones
+    //    denses, et la division y délave les lettres — c'était la cause du texte
+    //    gris et mou des premières versions.
+    // ponytail: transformation plane. Elle corrige l'inclinaison et la perspective,
+    // pas le gondolage du papier — il faudrait un maillage, pas une homographie.
+    const tiny = M(new cv.Mat()), bg = M(new cv.Mat()), flat = M(new cv.Mat());
+    cv.resize(page, tiny, new cv.Size(0, 0), .25, .25, cv.INTER_AREA);
+    cv.morphologyEx(tiny, tiny, cv.MORPH_CLOSE,
+                    M(cv.getStructuringElement(cv.MORPH_ELLIPSE,
+                      new cv.Size(BG_KERNEL, BG_KERNEL))));
+    cv.GaussianBlur(tiny, tiny, new cv.Size(0, 0), 6);   // lisse les marches du 1/4
+    cv.resize(tiny, bg, page.size(), 0, 0, cv.INTER_LINEAR);
+    cv.divide(page, bg, flat, 255);
+
+    // 2. Étirer le contraste sur la *luminance seule*. Étirer les trois canaux
+    //    séparément amplifie d'un facteur ~2,5 le bruit de chrominance JPEG du
+    //    papier et le tache de rose. Passer par TSV laisse la teinte intacte.
+    const hsv = M(new cv.Mat()), rgb = M(new cv.Mat());
+    cv.cvtColor(flat, rgb, cv.COLOR_RGBA2RGB);
+    cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+    const ch = M(new cv.MatVector());
+    cv.split(hsv, ch);
+    const hue = M(ch.get(0)), sat = M(ch.get(1)), val = M(ch.get(2));
+
+    //    Le seuil d'Otsu sépare l'encre du papier **sans rien présumer de leur
+    //    proportion** — c'est tout l'intérêt ici. Un percentile bas, lui, dépend
+    //    de la quantité d'encre : sur un bon de livraison presque vide (2 % de
+    //    texte) il tombe en plein sur le papier, et l'étalement grise la page
+    //    entière. Mesuré : le percentile passe de 126 à 250 selon le document,
+    //    Otsu reste entre 192 et 216 sur les mêmes.
+    const split = cv.threshold(val, M(new cv.Mat()), 0, 255,
+                               cv.THRESH_BINARY + cv.THRESH_OTSU);
+    const lo = Math.min(Math.max(split - INK_MARGIN, 0), 250);
+    const hi = Math.min(Math.max(split + PAPER_MARGIN, lo + 20), 255);
+    val.convertTo(val, -1, 255 / (hi - lo), -lo * 255 / (hi - lo));
+
+    // 3. Neutraliser le papier, raviver ce qui est vraiment coloré. En dessous du
+    //    plancher — papier, texte noir, bruit — la saturation tombe à zéro ; le
+    //    logo et le tampon, eux, passent largement au-dessus. C'est tout le
+    //    principe du rendu « couleur » d'un scanner de téléphone.
+    sat.convertTo(sat, -1, SAT_GAIN, -SAT_FLOOR * SAT_GAIN);
+
+    const merged = M(new cv.MatVector());
+    merged.push_back(hue); merged.push_back(sat); merged.push_back(val);
+    cv.merge(merged, hsv);
+    cv.cvtColor(hsv, rgb, cv.COLOR_HSV2RGB);
+
+    // 4. Masque flou. La photo est déjà passée par la compression du téléphone :
+    //    la netteté perdue ne revient pas, seul son *apparence* se rattrape.
+    const blurred = M(new cv.Mat()), out = M(new cv.Mat());
+    cv.GaussianBlur(rgb, blurred, new cv.Size(0, 0), 1.4);
+    cv.addWeighted(rgb, 1 + SHARPEN, blurred, -SHARPEN, 0, out);
+
+    const dst = document.createElement('canvas');
+    cv.imshow(dst, out);
+    return dst;
+  });
+}
+
+/**
+ * Éditeur de coins — la détection automatique se trompe surtout quand la feuille
+ * touche le bord du cadre ou repose sur un fond clair. Plutôt qu'un second
+ * algorithme, on laisse corriger à la main : c'est ça, le repli.
+ * Résout avec le quadrilatère retenu (repère du canevas source), ou null si annulé.
+ */
+function openCrop(canvas, quad) {
+  return new Promise(resolve => {
+    const dlg = $('#crop'), view = $('#crop-cv'), ctx = view.getContext('2d');
+    const fit = Math.min(900 / canvas.width, innerHeight * .65 / canvas.height, 1);
+    view.width = Math.round(canvas.width * fit);
+    view.height = Math.round(canvas.height * fit);
+
+    const full = () => [[0, 0], [view.width, 0], [view.width, view.height], [0, view.height]]
+      .map(([x, y]) => ({ x, y }));
+    // Sans détection, on ouvre sur un cadre légèrement rentré : des poignées
+    // collées au bord sont impossibles à attraper.
+    let q = quad ? quad.map(p => ({ x: p.x * fit, y: p.y * fit }))
+                 : full().map(p => ({ x: p.x * .94 + view.width * .03,
+                                      y: p.y * .94 + view.height * .03 }));
+
+    const draw = () => {
+      ctx.drawImage(canvas, 0, 0, view.width, view.height);
+      ctx.beginPath();                               // le cadre, puis le trou
+      ctx.rect(0, 0, view.width, view.height);
+      ctx.moveTo(q[0].x, q[0].y);
+      q.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(0,0,0,.45)';
+      ctx.fill('evenodd');
+      ctx.beginPath();
+      ctx.moveTo(q[0].x, q[0].y);
+      q.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.closePath();
+      ctx.strokeStyle = '#4f46e5'; ctx.lineWidth = 2; ctx.stroke();
+      q.forEach(p => {
+        ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, 2 * Math.PI);
+        ctx.fillStyle = '#fff'; ctx.fill(); ctx.stroke();
+      });
+    };
+    draw();
+
+    // Le canevas est redimensionné par le CSS : les coordonnées de la souris
+    // doivent repasser dans son repère interne, sinon les coins dérivent.
+    const at = e => {
+      const r = view.getBoundingClientRect();
+      return { x: (e.clientX - r.left) * view.width / r.width,
+               y: (e.clientY - r.top) * view.height / r.height };
+    };
+    let drag = -1;
+    view.onpointerdown = e => {
+      const p = at(e);
+      drag = q.findIndex(c => Math.hypot(c.x - p.x, c.y - p.y) < 24);
+      if (drag >= 0) view.setPointerCapture(e.pointerId);
+    };
+    view.onpointermove = e => {
+      if (drag < 0) return;
+      const p = at(e);
+      q[drag] = { x: Math.max(0, Math.min(view.width, p.x)),
+                  y: Math.max(0, Math.min(view.height, p.y)) };
+      draw();
+    };
+    view.onpointerup = () => { drag = -1; };
+
+    let picked = null;                               // Échap ferme sans rien changer
+    dlg.onclick = e => {
+      const a = e.target.closest('[data-crop]')?.dataset.crop;
+      if (a === 'reset') { q = full(); draw(); }
+      else if (a === 'ok') { picked = orderQuad(q.map(p => ({ x: p.x / fit, y: p.y / fit }))); dlg.close(); }
+      else if (a === 'cancel') dlg.close();
+    };
+    dlg.addEventListener('close', () => {
+      dlg.onclick = view.onpointerdown = view.onpointermove = view.onpointerup = null;
+      resolve(picked);
+    }, { once: true });
+    dlg.showModal();
+  });
 }
 
 /* ============================================================
@@ -404,8 +824,7 @@ async function handleFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
   if (!hookUrl()) {
-    $('#landing-msg').innerHTML =
-      '<span style="color:var(--err)">Configurez d\'abord l\'URL du service OCR ci-dessous.</span>';
+    note('Configurez d’abord l’URL du service OCR ci-dessous.', 'err');
     $('#settings').open = true;
     $('#hook').focus();
     return;
@@ -469,30 +888,65 @@ async function processPdf(doc, file) {
 
 async function processImage(doc, file) {
   doc.pageCount = 1;
-  doc.pages.push({ n: 1, rotation: 0, status: 'working', text: '', source: 'ocr' });
+  const page = { n: 1, rotation: 0, status: 'working', text: '', source: 'ocr' };
+  doc.pages.push(page);
   render();
-  await runPage(doc, doc.pages[0]);
+
+  // Une photo, c'est une seule page : on peut demander confirmation du cadrage
+  // sans transformer la démo en corvée de clics — ce qui serait le cas sur un
+  // PDF de cinq pages, d'où le bouton « Recadrer » page par page pour ceux-là.
+  // La détection ne réussit que sur fond franchement contrasté ; sur une nappe
+  // claire elle refuse, et c'est ici que l'utilisateur reprend la main.
+  const canvas = await renderRaw(doc, page);
+  // La détection propose, l'utilisateur dispose — y compris quand elle a trouvé.
+  // Elle se trompe rarement, mais quand elle se trompe elle rogne du texte, et
+  // sur une facture c'est la colonne des montants qui saute, à droite, là où la
+  // marge est la plus mince — sans que rien ne le signale. Un clic de
+  // confirmation par photo coûte moins cher qu'un montant manquant.
+  const found = await detectQuad(canvas);
+  page.quad = cvOk ? await openCrop(canvas, found) : found;
+
+  await runPage(doc, page);
 }
 
-/** OCR (ou ré-OCR) d'une page, en tenant compte de sa rotation courante. */
+/** OCR (ou ré-OCR) d'une page, en tenant compte de sa rotation et de son cadrage. */
 async function runPage(doc, page) {
   page.status = 'working';
   page.error = null;
   render();
   try {
-    const img = doc.pdf
-      ? await renderPdfPage(doc.pdf, page.n, page.rotation)
-      : await renderImageFile(doc.file, page.rotation);
-    const r = await ocrPage(doc.name, page.n, img);
+    const canvas = await renderRaw(doc, page);
+    // `undefined` = jamais analysée ; `null` = analysée sans résultat, ou plein
+    // cadre voulu par l'utilisateur. Les deux ne veulent pas dire la même chose.
+    if (page.quad === undefined) page.quad = await detectQuad(canvas);
+    const shot = scanify(canvas, page.quad);
+    // Affichées sous le texte : c'est la seule façon de voir *ce que la
+    // reconnaissance a réellement reçu*. En dessous de ~150 DPI, les rognures
+    // d'image dans le .docx sont attendues, pas un défaut de la chaîne.
+    page.imgW = shot.width; page.imgH = shot.height;
+    page.jpeg = canvasToJpeg(shot);
+    const r = await ocrPage(doc.name, page.n, page.jpeg);
     Object.assign(page, {
       text: (r.text || '').trim(), pdfBase64: r.pdfBase64,
       ms: r.ms, roundTripMs: r.roundTripMs, sentBytes: r.sentBytes,
+      // Positions des mots, dans le repère de l'image envoyée — donc déjà
+      // pivotées et recadrées comme elle. C'est la source du tableur local.
+      overlay: r.overlay ?? null,
       exitCode: r.exitCode, status: 'done',
     });
   } catch (e) {
     page.status = 'error';
     page.error = e.message;
   }
+  render();
+}
+
+/** Relance une page seule après un changement de rotation ou de cadrage. */
+async function redoPage(doc, page) {
+  busy = true; render();
+  await runPage(doc, page);
+  busy = false;
+  await rebuildPdf(doc);
   render();
 }
 
@@ -505,7 +959,14 @@ async function detectNativeText(pdf) {
     texts.push(t);
     chars += t.length;
   }
-  return { isNative: chars >= NATIVE_MIN_CHARS, chars, texts };
+  // Le total sur *tout* le document mentait sur les PDF mixtes : un scan de
+  // 12 pages dont la couverture porte 150 caractères dépassait le seuil, et
+  // aucune des 11 pages scannées n'était alors reconnue — elles ressortaient
+  // vides, sans le moindre signal. Chaque page doit donc porter sa couche texte.
+  // ponytail: une page volontairement blanche fait retomber tout le document
+  // dans l'OCR — quelques appels gaspillés, mais jamais de page vide en sortie.
+  // Pour trancher blanche/scannée il faudrait inspecter la liste d'opérateurs.
+  return { isNative: texts.every(t => t.length >= NATIVE_MIN_CHARS), chars, texts };
 }
 
 /** Fusionne les PDF consultables page par page en un seul fichier. */
@@ -552,6 +1013,9 @@ function fullText(doc) {
    ============================================================ */
 const esc = s => String(s ?? '').replace(/[&<>"]/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const note = (msg, kind = 'ok') => {
+  $('#landing-msg').innerHTML = msg ? `<span style="color:var(--${kind})">${esc(msg)}</span>` : '';
+};
 const kb = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' Mo' : Math.round(b / 1024) + ' Ko';
 const secs = ms => (ms / 1000).toFixed(1).replace('.', ',') + ' s';
 
@@ -675,14 +1139,24 @@ function renderText(d) {
         ${p.status === 'working' ? '<span class="spin"></span>' : ''}
         ${p.status === 'error' ? `<span class="tag err">${esc(p.error)}</span>` : ''}
         ${p.rotation ? `<span class="tag">pivotée ${p.rotation}°</span>` : ''}
+        ${p.source === 'ocr' && p.status !== 'working' ? (p.quad
+          ? `<span class="tag ok">recadrée</span>`
+          : `<span class="tag">cadrage auto impossible</span>`) : ''}
         <div class="spacer"></div>
         ${p.source === 'ocr' && p.status !== 'working' ? `
+          ${cvOk ? `<button class="btn sm ghost" data-crop-page="${p.n}"
+            title="Ajuster les quatre coins du document et relancer l'OCR">⤢ Recadrer</button>` : ''}
           <button class="btn sm ghost" data-rotate="${p.n}" title="Pivoter de 90° et relancer l'OCR">
             ⟳ Pivoter</button>` : ''}
       </div>
       ${p.status === 'working'
         ? '<pre class="empty">Analyse…</pre>'
         : `<pre${p.text ? '' : ' class="empty"'}>${esc(p.text || 'Aucun texte détecté sur cette page.')}</pre>`}
+      ${p.jpeg ? `<details class="sent">
+        <summary>Image envoyée à la reconnaissance — ${kb(p.sentBytes || b64Bytes(p.jpeg))}${
+          p.imgW ? `, ${p.imgW}×${p.imgH} px (~${Math.round(p.imgW / 8.27)} DPI en A4)` : ''}</summary>
+        <img src="${p.jpeg}" alt="Page ${p.n} telle qu'envoyée à la reconnaissance" loading="lazy">
+      </details>` : ''}
     </div>`).join('');
 }
 
@@ -726,7 +1200,7 @@ drop.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
 $('#hook').value = localStorage.getItem('ocrHook') || WEBHOOK_URL;
 $('#hook-save').onclick = () => {
   localStorage.setItem('ocrHook', $('#hook').value.trim());
-  $('#landing-msg').innerHTML = '<span style="color:var(--ok)">Service OCR enregistré.</span>';
+  note('Service OCR enregistré.');
 };
 if (!hookUrl()) $('#settings').open = true;
 render();
@@ -744,11 +1218,17 @@ document.addEventListener('click', async e => {
   if (rot && d && !busy) {
     const page = d.pages.find(p => p.n === +rot.dataset.rotate);
     page.rotation = (page.rotation + 90) % 360;
-    busy = true; render();
-    await runPage(d, page);
-    busy = false;
-    await rebuildPdf(d);
-    return render();
+    page.quad = undefined;               // les coins étaient dans l'ancien repère
+    return redoPage(d, page);
+  }
+
+  const crop = e.target.closest('[data-crop-page]');
+  if (crop && d && !busy) {
+    const page = d.pages.find(p => p.n === +crop.dataset.cropPage);
+    const quad = await openCrop(await renderRaw(d, page), page.quad);
+    if (!quad) return;
+    page.quad = quad;
+    return redoPage(d, page);
   }
 
   const act = e.target.closest('[data-act]')?.dataset.act;
@@ -764,11 +1244,18 @@ document.addEventListener('click', async e => {
     const label = btn.textContent;
     btn.disabled = true; btn.textContent = '⏳ Conversion…';
     try {
-      await exportDoc(d, act.slice(3));
-      $('#landing-msg').innerHTML = '<span style="color:var(--ok)">Fichier converti.</span>';
+      const how = await exportDoc(d, act.slice(3));
+      const t = d.llmTokens;
+      note(how === 'lu' && t
+        ? `Tableur transcrit — ${t.in} jetons lus, ${t.out} écrits ` +
+          `(≈ ${((t.in * 5 + t.out * 25) / 1e6).toFixed(3).replace('.', ',')} $).`
+        // Le compte de rognures est le verdict sur la résolution d'entrée :
+        // 0 = Adobe a tout rendu en texte, beaucoup = page trop basse en DPI.
+        : typeof how === 'number'
+          ? `Fichier converti — ${how} rognure${how > 1 ? 's' : ''} d’image.`
+          : 'Fichier converti.');
     } catch (err) {
-      $('#landing-msg').innerHTML =
-        `<span style="color:var(--err)">${err.message}</span>`;
+      note(err.message, 'err');
     } finally {
       btn.disabled = false; btn.textContent = label;
     }
@@ -803,20 +1290,92 @@ const blobToB64 = blob => new Promise((res, rej) => {
   r.readAsDataURL(blob);
 });
 
-/** PDF à convertir : l'original s'il y en a un, sinon celui reconstruit par l'OCR. */
+/**
+ * PDF envoyé à Adobe. La bonne question n'est pas « est-ce un PDF ? » mais
+ * « porte-t-il déjà du texte *visible* ? » : une couche texte d'origine se
+ * convertit fidèlement, des pixels non.
+ *
+ * Sinon, on assemble les pages redressées, et Adobe refait sa reconnaissance.
+ *
+ * Envoyer plutôt le PDF consultable d'OCR.space paraît évident — sa couche
+ * texte est bien là, pdf.js en extrait 209 éléments bien placés. Mesuré : le
+ * .docx revient alors avec 52 caractères, le seul filigrane. Adobe *jette* le
+ * texte invisible (mode de rendu 3), qu'il tient pour un artefact d'OCR et non
+ * pour du contenu, et il ne re-reconnaît pas une page qui porte déjà du texte —
+ * même avec `ocrLang`. Il ne reste que l'image. Voir README, « Ce qui part
+ * chez Adobe ».
+ */
 async function sourcePdf(doc) {
-  const isPdf = /\.pdf$/i.test(doc.name) || doc.file?.type === 'application/pdf';
-  if (isPdf && doc.file) return doc.file;
+  if (doc.native && doc.file) return doc.file;
+
+  // Un PDF scanné part **tel quel**, tant que l'utilisateur n'a ni pivoté ni
+  // recadré : ses pages sont déjà des images de scanner, les réencoder en JPEG
+  // ne peut rien ajouter. Mesuré sur `xp/img20260716_11311808.pdf` (scan 200 DPI)
+  // envoyé d'origine : 0 rognure d'image, 2 295 caractères, **5 tableaux**.
+  // Dès qu'une page est pivotée ou recadrée, la correction n'existe que dans nos
+  // pixels et il faut bien renvoyer ceux-là.
+  if (doc.pdf && doc.file && !doc.pages.some(p => p.rotation || p.quad)) return doc.file;
+
+  const scans = doc.pages.filter(p => p.jpeg);
+  if (scans.length) {
+    const out = await PDFLib.PDFDocument.create();
+    for (const p of scans) {
+      const img = await out.embedJpg(p.jpeg);
+      out.addPage([img.width, img.height])
+         .drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+    }
+    return new Blob([await out.save()], { type: 'application/pdf' });
+  }
+
   if (!doc.pdfUrl) throw new Error('Aucun PDF disponible pour ce document.');
   return (await fetch(doc.pdfUrl)).blob();
+}
+
+/**
+ * Rognures d'image d'un .docx. Adobe rend en image toute zone dont sa
+ * reconnaissance ne se porte pas garante : mesuré 18 sur une photo à 109 DPI,
+ * 0 sur un scan à 200. C'est donc le chiffre qui dit si la résolution d'entrée
+ * suffit — et le seul moyen de le savoir sans ouvrir Word et compter à l'œil.
+ *
+ * On lit le **répertoire central** du ZIP plutôt que de chercher « word/media/ »
+ * dans les octets : essayé, un nom qui traîne en clair dans les données est
+ * compté en plus, et le nom d'une entrée figure deux fois (en-tête local +
+ * répertoire). Mesuré sur une pièce d'essai : 3 rognures annoncées pour 1 image
+ * réelle. Un compteur faux est pire que pas de compteur.
+ * Renvoie null si ce n'est pas un ZIP.
+ */
+async function docxMedia(blob) {
+  const v = new DataView(await blob.arrayBuffer());
+  // Le commentaire final est de longueur variable : on remonte jusqu'à la
+  // signature de fin de répertoire au lieu de la supposer aux 22 derniers octets.
+  let eocd = v.byteLength - 22;
+  while (eocd >= 0 && v.getUint32(eocd, true) !== 0x06054b50) eocd--;
+  if (eocd < 0) return null;
+  let p = v.getUint32(eocd + 16, true), n = 0;
+  const dec = new TextDecoder();
+  for (let i = v.getUint16(eocd + 10, true); i-- > 0 && v.getUint32(p, true) === 0x02014b50;) {
+    const len = v.getUint16(p + 28, true);
+    if (dec.decode(new Uint8Array(v.buffer, p + 46, len)).startsWith('word/media/')) n++;
+    p += 46 + len + v.getUint16(p + 30, true) + v.getUint16(p + 32, true);
+  }
+  return n;
 }
 
 /**
  * Conversion Word/Excel déléguée à Adobe PDF Services via n8n.
  * Le format est imposé ici : Adobe convertit vers ce qu'on lui demande, il ne
  * devine pas qu'une page est un tableau.
+ * Renvoie le nombre de rognures pour un .docx, « lu » pour un tableur transcrit.
  */
 async function exportDoc(doc, format) {
+  // Le tableur passe par la lecture de la page : Adobe reconstruit les colonnes
+  // à partir des *filets* du tableau et écrase chaque ligne dans une cellule
+  // unique quand il n'y en a pas (`xp/HENKEL(P92)…`). Il reste le repli pour un
+  // PDF natif, dont aucune page n'est passée par la reconnaissance.
+  if (format === 'xlsx') {
+    const sheet = await llmXlsx(doc);
+    if (sheet) { downloadBlob(doc, '.xlsx', sheet); return 'lu'; }
+  }
   const blob = await sourcePdf(doc);
   if (blob.size > MAX_EXPORT_BYTES) {
     throw new Error(`PDF trop volumineux (${kb(blob.size)}, maximum ${kb(MAX_EXPORT_BYTES)}).`);
@@ -838,7 +1397,162 @@ async function exportDoc(doc, format) {
   if (!/^UEsDB/.test(data.fileBase64 || '')) {
     throw new Error('La réponse du service n’est pas un fichier Office valide.');
   }
-  downloadBlob(doc, '.' + format, b64ToBlob(data.fileBase64, EXPORT_MIME[format]));
+  const out = b64ToBlob(data.fileBase64, EXPORT_MIME[format]);
+  downloadBlob(doc, '.' + format, out);
+  return format === 'docx' ? await docxMedia(out) : null;
+}
+
+/* /* ============================================================
+   Tableur — lecture de la page par un modèle de vision
+   ------------------------------------------------------------
+   Reconstruire lignes et colonnes à partir des positions de mots ne converge
+   pas : une page porte souvent deux tableaux de géométries différentes plus de
+   la prose, et aucun jeu de colonnes global ne décrit les deux (mesuré sur
+   `xp/img20260716_11311808.pdf` — projection par corridors : 1 colonne ;
+   regroupement des bords gauches : 15). Le modèle lit la page comme un humain :
+   la mise en page cesse d'être un problème à résoudre.
+   ============================================================ */
+
+// « 1 234,56 » et « 56,221 » deviennent des nombres, sinon aucune somme Excel
+// ne fonctionne. Les codes article et les dates ne correspondent pas au motif.
+//
+// Le point est accepté comme séparateur décimal au même titre que la virgule :
+// le modèle normalise irrégulièrement, mesuré « 7,943 » et « 23.832 » dans le
+// même tableau de la même facture. Sur ces documents le séparateur de milliers
+// est l'espace, jamais le point — les deux sont donc bien des décimales.
+// ponytail: un document anglo-saxon (« 1,234.56 ») serait mal typé ; il faudrait
+// choisir le motif selon la langue du document.
+const NUM = /^-?\d{1,3}(?:[\s  ]\d{3})*(?:[.,]\d+)?$|^-?\d+(?:[.,]\d+)?$/;
+const typed = v => (NUM.test(v)
+  ? Number(String(v).replace(/[\s  ]/g, '').replace(',', '.'))
+  : v);
+
+/* ---------- écriture ZIP, sans dépendance ----------
+   .xlsx est un ZIP. Les entrées sont écrites **stockées** (méthode 0, sans
+   compression) : quelques Ko de XML ne valent pas un DecompressionStream, et
+   un en-tête ZIP mal aligné produit un fichier que rien n'ouvre. */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function zipStore(files, mime) {
+  const enc = new TextEncoder();
+  const body = [], central = [];
+  let offset = 0, cdSize = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), data = enc.encode(f.xml);
+    const crc = crc32(data), n = data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);          // version minimale
+    lh.setUint16(6, 0x0800, true);      // drapeau : noms en UTF-8
+    lh.setUint16(8, 0, true);           // méthode 0 = stocké
+    lh.setUint16(12, 0x21, true);       // date figée : sortie reproductible
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, n, true); lh.setUint32(22, n, true);
+    lh.setUint16(26, name.length, true);
+    body.push(new Uint8Array(lh.buffer), name, data);
+
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true);
+    cd.setUint16(4, 20, true); cd.setUint16(6, 20, true);
+    cd.setUint16(8, 0x0800, true); cd.setUint16(10, 0, true);
+    cd.setUint16(14, 0x21, true);
+    cd.setUint32(16, crc, true);
+    cd.setUint32(20, n, true); cd.setUint32(24, n, true);
+    cd.setUint16(28, name.length, true);
+    cd.setUint32(42, offset, true);     // position de l'en-tête local
+    central.push(new Uint8Array(cd.buffer), name);
+    offset += 30 + name.length + n;
+    cdSize += 46 + name.length;
+  }
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, files.length, true); eocd.setUint16(10, files.length, true);
+  eocd.setUint32(12, cdSize, true); eocd.setUint32(16, offset, true);
+  return new Blob([...body, ...central, new Uint8Array(eocd.buffer)], { type: mime });
+}
+
+const xmlEsc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const colRef = i => { let s = ''; for (i++; i > 0;) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = (i - m - 1) / 26; } return s; };
+
+/** Classeur minimal : cinq parties, pas de styles ni de table de chaînes. */
+function buildXlsx(rows) {
+  const sheet = rows.map((r, y) => `<row r="${y + 1}">${
+    r.map((v, x) => v === '' || v == null ? '' : (typeof v === 'number'
+      ? `<c r="${colRef(x)}${y + 1}"><v>${v}</v></c>`
+      : `<c r="${colRef(x)}${y + 1}" t="inlineStr"><is><t xml:space="preserve">${xmlEsc(v)}</t></is></c>`)
+    ).join('')}</row>`).join('');
+  const P = 'http://schemas.openxmlformats.org';
+  return zipStore([
+    { name: '[Content_Types].xml', xml:
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="${P}/package/2006/content-types">` +
+      `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+      `<Default Extension="xml" ContentType="application/xml"/>` +
+      `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+      `<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>` },
+    { name: '_rels/.rels', xml:
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${P}/package/2006/relationships">` +
+      `<Relationship Id="rId1" Type="${P}/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>` },
+    { name: 'xl/workbook.xml', xml:
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="${P}/spreadsheetml/2006/main" ` +
+      `xmlns:r="${P}/officeDocument/2006/relationships"><sheets><sheet name="Feuille1" sheetId="1" r:id="rId1"/></sheets></workbook>` },
+    { name: 'xl/_rels/workbook.xml.rels', xml:
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${P}/package/2006/relationships">` +
+      `<Relationship Id="rId1" Type="${P}/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>` },
+    { name: 'xl/worksheets/sheet1.xml', xml:
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="${P}/spreadsheetml/2006/main">` +
+      `<sheetData>${sheet}</sheetData></worksheet>` },
+  ], EXPORT_MIME.xlsx);
+}
+
+/**
+ * Le classeur du document, ou null si aucune page n'a d'image à lire — un PDF
+ * natif n'en a pas, et Adobe le convertit très fidèlement de toute façon.
+ * ponytail: on n'envoie que les pages passées par la reconnaissance ; pour un
+ * PDF natif il faudrait rendre les pages en images d'abord.
+ */
+async function llmXlsx(doc) {
+  const pages = doc.pages.filter(p => p.jpeg);
+  if (!pages.length) return null;
+
+  const rows = [];
+  let tokensIn = 0, tokensOut = 0;
+  for (const p of pages) {
+    note(`Lecture de la page ${p.n} sur ${pages.length}…`);
+    const res = await fetch(tableurUrl(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Le texte OCR part avec l'image : mesuré, sans lui le modèle omet
+      // purement et simplement le tableau des articles.
+      body: JSON.stringify({ imageBase64: p.jpeg, texte: p.text ?? '' }),
+    });
+    if (!res.ok) throw new Error(`Le service de lecture a répondu ${res.status} ${res.statusText}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Lecture échouée.');
+    tokensIn += data.usage?.input_tokens ?? 0;
+    tokensOut += data.usage?.output_tokens ?? 0;
+
+    for (const t of data.tables ?? []) {
+      if (rows.length) rows.push([]);              // une ligne vide entre deux tableaux
+      if (t.titre) rows.push([t.titre]);
+      for (const l of t.lignes) rows.push(l.map(typed));
+    }
+  }
+  if (!rows.length) throw new Error('Aucun tableau détecté sur ce document.');
+  doc.llmTokens = { in: tokensIn, out: tokensOut };
+  return buildXlsx(rows);
 }
 
 /* ============================================================
@@ -882,11 +1596,145 @@ if (new URLSearchParams(location.search).has('selftest')) (async () => {
 
   // 4. l'URL d'export se déduit de celle de l'OCR, barre finale comprise
   const cases = [
-    ['http://localhost:5678/webhook/ocr',   'http://localhost:5678/webhook/export'],
-    ['https://n8n.example.com/webhook/ocr/', 'https://n8n.example.com/webhook/export'],
+    ['http://localhost:5678/webhook/ocr',    'export',  'http://localhost:5678/webhook/export'],
+    ['https://n8n.example.com/webhook/ocr/', 'tableur', 'https://n8n.example.com/webhook/tableur'],
   ];
-  cases.forEach(([from, want]) =>
-    ok(toExportUrl(from) === want, `toExportUrl(${from}) → ${toExportUrl(from)}`));
+  cases.forEach(([from, nom, want]) =>
+    ok(toSibling(from, nom) === want, `toSibling(${from}, ${nom}) → ${toSibling(from, nom)}`));
+
+  // 5. la géométrie du recadrage — la partie qui peut produire en silence un
+  //    résultat plausible mais faux. Feuille blanche penchée sur fond sombre.
+  const scene = document.createElement('canvas');
+  scene.width = 600; scene.height = 800;
+  const sc = scene.getContext('2d');
+  sc.fillStyle = '#202020'; sc.fillRect(0, 0, 600, 800);
+  // La feuille couvre 64 % du cadre : en dessous de MIN_QUAD_AREA la détection
+  // refuserait, à raison — un petit quadrilatère est un tableau, pas une page.
+  const corners = [{ x: 60, y: 60 }, { x: 545, y: 110 }, { x: 520, y: 745 }, { x: 40, y: 700 }];
+  sc.fillStyle = '#fff';
+  sc.beginPath(); sc.moveTo(corners[0].x, corners[0].y);
+  corners.slice(1).forEach(p => sc.lineTo(p.x, p.y));
+  sc.closePath(); sc.fill();
+
+  ok(JSON.stringify(orderQuad([corners[2], corners[0], corners[3], corners[1]]))
+     === JSON.stringify(corners), 'orderQuad rétablit l’ordre tl, tr, br, bl');
+
+  const found = await detectQuad(scene);
+  if (!found) {
+    ok(false, 'aucun quadrilatère détecté (OpenCV chargé ?)');
+  } else {
+    const off = Math.max(...found.map((p, i) => Math.hypot(p.x - corners[i].x, p.y - corners[i].y)));
+    ok(off < 12, `coins détectés à ${off.toFixed(1)} px près (max 12)`);
+    // Les côtés mesurent 488×640 : la page redressée doit garder ce rapport.
+    const flat = scanify(scene, found);
+    const ratio = flat.width / flat.height;
+    ok(Math.abs(ratio - 488 / 640) < .05,
+       `page redressée ${flat.width}×${flat.height}, rapport ${ratio.toFixed(3)} (attendu ≈ 0,762)`);
+  }
+
+  // 6. le PDF envoyé à Adobe est bien rebâti à partir des pages redressées, et
+  //    non repris du PDF consultable — dont Adobe jette la couche texte
+  //    invisible et ne rend que le filigrane (mesuré : 52 caractères).
+  const sheet = document.createElement('canvas');
+  sheet.width = 40; sheet.height = 60;
+  const shc = sheet.getContext('2d');
+  shc.fillStyle = '#fff'; shc.fillRect(0, 0, 40, 60);
+  const built = await PDFLib.PDFDocument.load(await (await sourcePdf(
+    { native: false, pages: [{ jpeg: sheet.toDataURL('image/jpeg', .8) }] })).arrayBuffer());
+  ok(built.getPageCount() === 1 && Math.round(built.getPage(0).getWidth()) === 40,
+     `PDF d’export : ${built.getPageCount()} page de ` +
+     `${Math.round(built.getPage(0).getWidth())}×${Math.round(built.getPage(0).getHeight())} pt`);
+
+  // 7. le rendu « scan » : une page barrée d'une ombre, avec du texte gris pâle,
+  //    doit ressortir fond blanc et texte noir. C'est le seul contrôle qui
+  //    échoue si l'estimation du fond ou l'étalement de luminance se dérègle.
+  const shaded = document.createElement('canvas');
+  shaded.width = 600; shaded.height = 450;
+  const sx = shaded.getContext('2d');
+  const grad = sx.createLinearGradient(0, 0, 600, 450);
+  grad.addColorStop(0, '#ffffff');
+  grad.addColorStop(1, '#8a8a8a');                 // ombre en travers de la page
+  sx.fillStyle = grad; sx.fillRect(0, 0, 600, 450);
+  sx.fillStyle = '#6e6e6e';                        // « texte » gris pâle
+  sx.font = 'bold 44px sans-serif';
+  sx.fillText('FACTURE 275,500', 40, 240);
+
+  const scanned = scanify(shaded, null);
+  const px = scanned.getContext('2d')
+    .getImageData(0, 0, scanned.width, scanned.height).data;
+  const lum = i => (px[i] + px[i + 1] + px[i + 2]) / 3;
+  let darkest = 255;
+  for (let i = 0; i < px.length; i += 4) darkest = Math.min(darkest, lum(i));
+  const corner = lum(((scanned.height - 8) * scanned.width + scanned.width - 8) * 4);
+  ok(corner > 225 && darkest < 70,
+     `rendu scan : coin le plus ombré ${Math.round(corner)} (attendu > 225), ` +
+     `texte le plus noir ${Math.round(darkest)} (attendu < 70)`);
+
+  // 8. jamais d'agrandissement : une photo recompressée par WhatsApp doit
+  //    ressortir à sa taille native, pas gonflée à TARGET_WIDTH.
+  const smallImg = document.createElement('canvas');
+  smallImg.width = 300; smallImg.height = 500;
+  smallImg.getContext('2d').fillStyle = '#eee';
+  smallImg.getContext('2d').fillRect(0, 0, 300, 500);
+  const smallBlob = await new Promise(r => smallImg.toBlob(r, 'image/jpeg'));
+  const kept = await renderImageCanvas(smallBlob, 0);
+  ok(kept.width === 300, `renderImageCanvas n’agrandit pas : 300 px → ${kept.width} px`);
+
+  // 9. un PDF scanné non retouché part tel quel chez Adobe — mesuré : 5 tableaux
+  //    et 0 rognure d'image, contre 0 tableau sur la même page réencodée.
+  const asPdf = new Blob(['%PDF-1.4 factice'], { type: 'application/pdf' });
+  const jpegPage = sheet.toDataURL('image/jpeg', .8);
+  ok(await sourcePdf({ pdf: {}, file: asPdf, pages: [{ n: 1, jpeg: jpegPage }] }) === asPdf,
+     'PDF scanné intact : transmis tel quel');
+  ok(await sourcePdf({ pdf: {}, file: asPdf, pages: [{ n: 1, rotation: 90, jpeg: jpegPage }] }) !== asPdf,
+     'page pivotée : PDF rebâti à partir des pixels corrigés');
+
+  // 10. la régression qui vidait les PDF mixtes : le seuil doit valoir page par
+  //     page, pas sur le total du document.
+  const fakePdf = texts => ({
+    numPages: texts.length,
+    getPage: async n => ({ getTextContent: async () => ({ items: [{ str: texts[n - 1] }] }) }),
+  });
+  const dense = 'x'.repeat(NATIVE_MIN_CHARS + 40);
+  ok((await detectNativeText(fakePdf([dense, dense]))).isNative === true,
+     'PDF entièrement textuel : reconnu natif, aucun appel OCR');
+  ok((await detectNativeText(fakePdf([dense, '']))).isNative === false,
+     'PDF mixte (couverture textuelle + page scannée) : repasse par l’OCR');
+
+  // 11. l'écriture ZIP — le morceau qui produit en silence un fichier que rien
+  //     n'ouvre si un décalage d'en-tête se glisse dedans. Vecteur de référence.
+  ok(crc32(new TextEncoder().encode('123456789')) === 0xCBF43926,
+     'crc32("123456789") = 0xCBF43926');
+  ok(typed('56,221') === 56.221 && typed('C0071211') === 'C0071211',
+     'typed : « 56,221 » → nombre, « C0071211 » → texte');
+
+  const book = new Uint8Array(await buildXlsx([
+    ['Article', 'Prix'], ['Clavier', typed('56,221')],
+  ]).arrayBuffer());
+  const tail = book.slice(-22);
+  ok(book[0] === 0x50 && book[1] === 0x4B &&
+     tail[0] === 0x50 && tail[1] === 0x4B && tail[2] === 0x05 && tail[3] === 0x06,
+     `buildXlsx : signatures ZIP en tête et en fin de répertoire (${book.length} octets)`);
+  // Le nombre d'entrées annoncé doit correspondre aux cinq parties écrites.
+  ok(new DataView(tail.buffer, tail.byteOffset).getUint16(10, true) === 5,
+     `buildXlsx : ${new DataView(tail.buffer, tail.byteOffset).getUint16(10, true)} entrées annoncées (attendu 5)`);
+
+  // 12. docxMedia compte les entrées du répertoire central, pas les chaînes qui
+  //     traînent : la pièce d'essai porte exprès un « word/media/ » en clair dans
+  //     les données, et le nom réel y figure deux fois (en-tête + répertoire).
+  const fauxDocx = n => zipStore([
+    { name: 'word/document.xml', xml: '<w:document/>' },
+    ...Array.from({ length: n }, (_, i) => ({
+      name: `word/media/image${i + 1}.png`,
+      xml: 'PNG word/media/leurre.png',
+    })),
+  ], EXPORT_MIME.docx);
+  for (const n of [0, 1, 5]) {
+    const got = await docxMedia(fauxDocx(n));
+    ok(got === n, `docxMedia : ${n} rognure(s) attendue(s) → ${got}`);
+  }
+  ok(await docxMedia(new Blob([new Uint8Array(50)])) === null,
+     'docxMedia : un fichier qui n’est pas un ZIP renvoie null sans lever');
 
   console.log('Auto-test terminé.');
 })();

@@ -1,4 +1,6 @@
 xp/
+# photos de téléphone servant de suite de régression — dépôt public, factures réelles
+new exp/
 resultat-consultable.pdf
 .claude/settings.local.json
 # workflows contenant de vraies clés — jamais versionnés

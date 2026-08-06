@@ -1,0 +1,224 @@
+{
+  "id": "tableurNemotron",
+  "name": "Tableaux — Nemotron VL (NVIDIA)",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Configuration\n\n1. Clé sur build.nvidia.com, puis définir\n   `NVIDIA_API_KEY` dans les variables\n   d'environnement du serveur n8n et\n   **redémarrer n8n**.\n\n2. **Activer** le workflow.\n\n### Ce qui est envoyé\n\nL'image **et** le texte OCR de la même page.\nMesuré : sans le texte, le modèle omet purement\net simplement le tableau des articles. Avec, il\nle rend ligne par ligne. Le texte fait foi pour\nles caractères, l'image pour la mise en page.\n\n### ⚠ Fiabilité mesurée\n\nSur `new exp/Tunisianet.jpeg`, à température 0,\nle code de TVA a été lu `T00`, `TOO`, `TO7`,\n`T07` et `T02` selon les exécutions, et les\nséparateurs décimaux sont mélangés dans un même\ntableau (`7,943` mais `23.832`).\n\nLes totaux, eux, sont stables et cohérents\n(257,542 + 17,958 = 275,500).\n\n**Sortie à relire avant usage comptable.**",
+        "height": 700,
+        "width": 400,
+        "color": 4
+      },
+      "id": "c3000000-0000-4000-8000-000000000001",
+      "name": "Lisez-moi",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -320,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tableur",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "c3000000-0000-4000-8000-000000000002",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        160,
+        160
+      ],
+      "webhookId": "d4e5f6a7-8b9c-4d0e-9f1a-2b3c4d5e6f70"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Requête NVIDIA NIM, format OpenAI. L'image passe en bloc « image_url » :\n// mesuré, la balise <img> des anciens NIM n'est pas vue comme une image ici —\n// le modèle décrit alors le base64 comme du texte, en 40 s.\n//\n// Pas de « response_format » : le décodage guidé de ce point d'accès tombe en\n// panne (HTTP 500 « EngineCore ») ou rend du JSON malformé dès le deuxième\n// appel d'une série. Le modèle rend donc des lignes « n°|cellule|cellule »\n// qu'on découpe soi-même — une barre verticale n'apparaît pas dans une cellule\n// recopiée d'une facture.\nconst body = $input.first().json.body ?? {};\nif (!/^data:image\\/(?:jpeg|png|webp|gif);base64,/.test(String(body.imageBase64 || ''))) {\n  return [{ json: { ok: false, error: 'imageBase64 doit être une data URL d\\u2019image.' } }];\n}\n\n// Le texte OCR fait foi pour les caractères, l'image pour la mise en page.\n// Mesuré : sans le texte, le modèle omet le tableau des articles.\nconst ocr = String(body.texte || '').slice(0, 20000);\nconst consigne = [\n  'Voici une page de facture, en image, et le texte que la reconnaissance de',\n  'caractères en a extrait. Le texte OCR fait foi pour les CARACTÈRES ;',\n  \"l'image fait foi pour la MISE EN PAGE (quelles cellules vont ensemble).\",\n  '',\n  'Transcris TOUS les tableaux, sans en omettre aucun. Le tableau des articles',\n  '(références, désignations, quantités, prix) doit toujours y figurer.',\n  '',\n  \"Réponds UNIQUEMENT par des lignes de texte : pas de phrase d'introduction,\",\n  'pas de commentaire, pas de Markdown. Une ligne par ligne de tableau,',\n  'cellules séparées par une barre verticale, précédée du numéro du tableau :',\n  '1|cellule|cellule|cellule',\n  '1|cellule|cellule|cellule',\n  '2|cellule|cellule',\n  '',\n  \"Les trois lignes ci-dessus ne montrent que la FORME. N'en recopie jamais le\",\n  'contenu : « cellule » est un emplacement, pas un mot à écrire.',\n  '',\n  'Tu ne calcules rien, tu ne complètes rien, tu ne corriges rien.',\n  \"- N'écris que des caractères présents dans le texte OCR ci-dessous.\",\n  '- Recopie les nombres exactement, virgule comprise : « 56,221 » reste',\n  '  « 56,221 » et jamais « 56.221 ».',\n  '- Cellule vide : rien entre les deux barres verticales.',\n  \"- Toutes les lignes d'un même tableau portent le MÊME nombre de cellules :\",\n  '  garde les cellules vides au lieu de les sauter, sinon les colonnes glissent.',\n  \"- Cellule illisible : ?  N'invente jamais un montant.\",\n  '- Attention aux 0 (chiffre) et O (lettre) dans les codes.',\n  \"- Un bloc d'adresse ou des conditions générales ne sont pas un tableau.\",\n  '',\n  '--- TEXTE OCR ---',\n  ocr,\n].join('\\n');\n\nreturn [{ json: { ok: true, requete: {\n  model: 'nvidia/nemotron-nano-12b-v2-vl',\n  max_tokens: 4096,\n  temperature: 0,\n  top_p: 1,\n  stream: false,\n  messages: [{ role: 'user', content: [\n    { type: 'text', text: consigne },\n    { type: 'image_url', image_url: { url: body.imageBase64 } },\n  ] }],\n} } }];"
+      },
+      "id": "c3000000-0000-4000-8000-000000000003",
+      "name": "Requête",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        380,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "c3000000-0000-4000-8000-000000000004",
+      "name": "Image valide ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        600,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.NVIDIA_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requete) }}",
+        "options": {
+          "timeout": 180000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "c3000000-0000-4000-8000-000000000005",
+      "name": "Nemotron",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        840,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Découpe « n°|cellule|cellule » en tableaux. Une ligne qui ne commence pas par\n// un numéro suivi d'une barre est du bavardage du modèle : on la jette plutôt\n// que de la laisser polluer le classeur.\nconst r = $input.first().json ?? {};\nif (r.error) {\n  return [{ json: { ok: false, error: 'NVIDIA : ' + (r.error.message ?? JSON.stringify(r.error)) } }];\n}\n// Une erreur d'authentification ne revient pas en JSON : n8n emballe le corps\n// texte dans « data ». Sans ce cas, une clé absente se plaignait d'une\n// « réponse sans contenu texte », ce qui désigne le mauvais coupable.\nif (typeof r.data === 'string') {\n  return [{ json: { ok: false, error: 'NVIDIA a refusé la requête : ' + r.data.slice(0, 200) } }];\n}\nconst texte = r.choices?.[0]?.message?.content;\nif (typeof texte !== 'string') {\n  return [{ json: { ok: false, error: 'Réponse du modèle sans contenu texte.' } }];\n}\n\n// Le numéro annoncé par le modèle ne signifie rien : mesuré sur cinq photos,\n// il numérote tantôt les tableaux (1,1,2), tantôt chaque ligne (1 à 11),\n// tantôt rien du tout (tout à 1). Le grouper dessus rendait onze « tableaux »\n// d'une ligne pour une facture qui en compte trois. On ne garde le numéro que\n// comme marque de début de ligne — ce filtre a jeté les 438 lignes vides d'un\n// emballement du modèle — et on coupe sur le changement de nombre de colonnes.\n// ponytail : deux tableaux voisins de même largeur fusionnent. Couper sur\n// autre chose (une ligne d'en-tête ?) le jour où un client s'en plaint.\nconst tables = [];\nfor (const ligne of texte.split('\\n')) {\n  const m = ligne.trim().match(/^(\\d+)\\|(.*)$/);\n  if (!m) continue;\n  const cellules = m[2].split('|').map(s => s.trim());\n  if (!cellules.some(Boolean)) continue;\n  const courant = tables[tables.length - 1];\n  if (courant && courant.lignes[0].length === cellules.length) courant.lignes.push(cellules);\n  else tables.push({ titre: 'Tableau ' + (tables.length + 1), lignes: [cellules] });\n}\nif (!tables.length) {\n  return [{ json: { ok: false, error: 'Aucun tableau reconnu dans la réponse du modèle.' } }];\n}\nreturn [{ json: { ok: true, tables, usage: r.usage ?? null } }];"
+      },
+      "id": "c3000000-0000-4000-8000-000000000006",
+      "name": "Sortie",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      },
+      "id": "c3000000-0000-4000-8000-000000000007",
+      "name": "Répondre",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Requête",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Requête": {
+      "main": [
+        [
+          {
+            "node": "Image valide ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image valide ?": {
+      "main": [
+        [
+          {
+            "node": "Nemotron",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Répondre",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sortie": {
+      "main": [
+        [
+          {
+            "node": "Répondre",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nemotron": {
+      "main": [
+        [
+          {
+            "node": "Sortie",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
